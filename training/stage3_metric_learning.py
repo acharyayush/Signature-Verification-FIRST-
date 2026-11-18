@@ -8,16 +8,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Literal, Sequence
 
-import cv2
+import numpy as np
 import timm
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from preprocessing.signature_preprocessing import (
-    DEFAULT_TARGET_SIZE,
-    preprocess_signature,
+    load_preprocessed_image,
     to_model_input,
 )
 
@@ -112,6 +111,48 @@ def load_manifest(
     return train, validation
 
 
+def read_split(
+    manifest: str | Path,
+    root: str | Path,
+    splits: set[str],
+) -> list[SignatureRecord]:
+    """Read manifest rows whose ``split`` column is in ``splits``.
+
+    :func:`load_manifest` returns only the train and validation rows it needs for
+    training. Evaluation and fusion fitting also need the test rows, so this helper
+    reads an arbitrary split selection. It is the single split reader used by
+    ``training.evaluate`` and ``training.fit_fusion``, which keeps both scripts
+    scoring exactly the same records.
+
+    Args:
+        manifest: CSV manifest with ``image_path,signer_id,is_forgery,split``.
+        root: Directory used to resolve relative image paths.
+        splits: Lower-case split names to keep, e.g. ``{"val", "validation"}``.
+
+    Raises:
+        ValueError: If no row matches ``splits``.
+    """
+    manifest_path = Path(manifest).expanduser().resolve()
+    image_root = Path(root).expanduser().resolve()
+    wanted = {name.strip().lower() for name in splits}
+    records: list[SignatureRecord] = []
+    with manifest_path.open(newline="", encoding="utf-8") as file:
+        for row in csv.DictReader(file):
+            if row["split"].strip().lower() not in wanted:
+                continue
+            path = Path(row["image_path"].strip()).expanduser()
+            records.append(
+                SignatureRecord(
+                    image_path=(path if path.is_absolute() else image_root / path).resolve(),
+                    signer_id=row["signer_id"].strip(),
+                    is_forgery=row["is_forgery"].strip().lower() in {"1", "true", "yes"},
+                )
+            )
+    if not records:
+        raise ValueError(f"no manifest rows for splits {sorted(wanted)}")
+    return records
+
+
 class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
     """Load signatures, preprocess them, and return model-ready tensors and labels."""
 
@@ -133,23 +174,13 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
 
     def __getitem__(self, index: int) -> tuple[Tensor, int, bool]:
         record = self.records[index]
-        # Already-preprocessed files are grayscale at the model's fixed input size.
-        read_mode = cv2.IMREAD_GRAYSCALE if self.already_preprocessed else cv2.IMREAD_COLOR
-        image = cv2.imread(str(record.image_path), read_mode)
-        if image is None:
-            raise FileNotFoundError(f"could not read signature image: {record.image_path}")
-
-        if self.already_preprocessed:
-            expected_shape = (DEFAULT_TARGET_SIZE[1], DEFAULT_TARGET_SIZE[0])
-            if image.shape != expected_shape:
-                raise ValueError(
-                    f"preprocessed image {record.image_path} has shape {image.shape}; "
-                    f"expected {expected_shape}"
-                )
-            preprocessed = image
-        else:
-            preprocessed = preprocess_signature(image, ink=self.ink)
-
+        # One shared loading path: the handcrafted feature extractor reads the same
+        # pixels through ``load_preprocessed_image``, so the two modalities cannot drift.
+        preprocessed = load_preprocessed_image(
+            record.image_path,
+            already_preprocessed=self.already_preprocessed,
+            ink=self.ink,
+        )
         # The model accepts three channels; preprocessing repeats grayscale for RGB.
         tensor = torch.from_numpy(to_model_input(preprocessed))
         return tensor, self.signer_to_index[record.signer_id], record.is_forgery
@@ -351,3 +382,39 @@ def triplet_loss(
         "mean_negative": selected_negative.mean().detach(),
         "active_fraction": (per_anchor_loss > 0).float().mean().detach(),
     }
+
+
+@torch.no_grad()
+def embed_records(
+    model: nn.Module,
+    records: Sequence[SignatureRecord],
+    *,
+    already_preprocessed: bool = False,
+    device: torch.device | str = "cpu",
+    batch_size: int = 64,
+    workers: int = 0,
+) -> np.ndarray:
+    """Embed ``records`` in order and return an ``(N, embedding_dim)`` float array.
+
+    The output row order matches ``records``, so callers can index embeddings by
+    manifest position. This is the embedding routine shared by ``training.evaluate``
+    and ``training.fit_fusion``; keeping one implementation guarantees the deep score
+    in a fusion fit is computed from the same forward pass as the reported baseline.
+
+    Args:
+        model: A trained Siamese embedding model in evaluation mode.
+        records: Manifest records to embed.
+        already_preprocessed: Forwarded to :class:`SignatureDataset`.
+        device: Device used for the forward pass.
+        batch_size: DataLoader batch size.
+        workers: DataLoader worker count.
+    """
+    dataset = SignatureDataset(
+        records,
+        {record.signer_id: 0 for record in records},
+        already_preprocessed=already_preprocessed,
+    )
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
+    model.eval()
+    chunks = [model(images.to(device)).cpu().numpy() for images, _, _ in loader]
+    return np.concatenate(chunks)

@@ -8,97 +8,77 @@ references. A query's score is its mean cosine similarity to those references.
 The decision threshold is chosen at the EER on the validation signers and then
 applied unchanged to the test signers, so the test numbers are not tuned on test data.
 
+When ``--fusion-config`` is supplied, the same protocol is repeated with the fused
+score from :mod:`scoring.fusion`. The deep-only baseline block is still reported
+unchanged, so one run shows both results side by side. Fused decisions use the
+threshold stored in the fusion config when the fitter recorded one, falling back to
+the validation EER threshold otherwise.
+
 Usage:
     python -m training.evaluate --checkpoint checkpoints/cedar_v1/best_model.pt \
         --manifest data/processed/manifest.csv --already-preprocessed
+    python -m training.evaluate ... --fusion-config checkpoints/fusion/fusion.json
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 
+from scoring.fusion import (
+    Enrollment,
+    FusionScorer,
+    enroll_and_build_queries,
+    load_fusion_config,
+    score_queries,
+)
+from scoring.handcrafted_features import describe_records
+from scoring.metrics import eer_threshold, rates_at_threshold
 from training.stage3_metric_learning import (
-    SignatureDataset,
-    SignatureRecord,
     SiameseSignatureModel,
+    embed_records,
+    read_split,
 )
 
 
-def _read_split(manifest: Path, root: Path, splits: set[str]) -> list[SignatureRecord]:
-    records = []
-    with manifest.open(newline="", encoding="utf-8") as file:
-        for row in csv.DictReader(file):
-            if row["split"].strip().lower() not in splits:
-                continue
-            path = Path(row["image_path"].strip())
-            records.append(
-                SignatureRecord(
-                    image_path=(path if path.is_absolute() else root / path).resolve(),
-                    signer_id=row["signer_id"].strip(),
-                    is_forgery=row["is_forgery"].strip().lower() in {"1", "true", "yes"},
-                )
-            )
-    if not records:
-        raise ValueError(f"no manifest rows for splits {sorted(splits)}")
-    return records
-
-
-@torch.no_grad()
-def _embed(model, records, already_preprocessed, device, batch_size, workers) -> np.ndarray:
-    dataset = SignatureDataset(
-        records, {r.signer_id: 0 for r in records}, already_preprocessed=already_preprocessed
+def _evaluate_split(
+    records,
+    embeddings: np.ndarray,
+    descriptors,
+    references: int,
+    scorer: FusionScorer | None,
+    max_random_queries: int | None,
+) -> dict[str, np.ndarray]:
+    """Run the reference protocol and return deep (and fused) scores by query kind."""
+    enrollment: Enrollment = enroll_and_build_queries(
+        records, references, max_random_queries=max_random_queries
     )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
-    model.eval()
-    chunks = [model(images.to(device)).cpu().numpy() for images, _, _ in loader]
-    return np.concatenate(chunks)
+    return score_queries(embeddings, descriptors or [], enrollment, scorer)
 
 
-def _scores(records, embeddings, references: int):
-    """Return (genuine, skilled, random) score arrays under the reference protocol."""
-    by_signer = defaultdict(lambda: {"gen": [], "forg": []})
-    for index, record in enumerate(records):
-        by_signer[record.signer_id]["forg" if record.is_forgery else "gen"].append(index)
-
-    refs = {}
-    for signer, groups in by_signer.items():
-        if len(groups["gen"]) <= references:
-            raise ValueError(f"{signer} has too few genuine signatures for {references} references")
-        refs[signer] = embeddings[groups["gen"][:references]]
-
-    genuine, skilled, random = [], [], []
-    for signer, groups in by_signer.items():
-        def score(index: int, ref_signer: str = signer) -> float:
-            return float((refs[ref_signer] @ embeddings[index]).mean())
-
-        genuine += [score(i) for i in groups["gen"][references:]]
-        skilled += [score(i) for i in groups["forg"]]
-        for other, other_groups in by_signer.items():
-            if other != signer:
-                random += [score(i) for i in other_groups["gen"][references:]]
-    return np.array(genuine), np.array(skilled), np.array(random)
-
-
-def _rates(genuine, negatives, threshold):
-    frr = float((genuine < threshold).mean())
-    far = float((negatives >= threshold).mean())
-    return far, frr
-
-
-def _eer_threshold(genuine, negatives):
-    candidates = np.unique(np.concatenate([genuine, negatives]))
-    gaps = [abs(_rates(genuine, negatives, t)[0] - _rates(genuine, negatives, t)[1]) for t in candidates]
-    threshold = float(candidates[int(np.argmin(gaps))])
-    far, frr = _rates(genuine, negatives, threshold)
-    return threshold, (far + frr) / 2
+def _metrics(scores: dict[str, np.ndarray], prefix: str, threshold: float) -> dict[str, object]:
+    """Return the FAR / FRR / EER block for one score family and split."""
+    genuine = scores[f"{prefix}_genuine"]
+    skilled = scores[f"{prefix}_skilled"]
+    random = scores[f"{prefix}_random"]
+    far_skilled, frr = rates_at_threshold(genuine, skilled, threshold)
+    far_random, _ = rates_at_threshold(genuine, random, threshold)
+    _, eer_skilled = eer_threshold(genuine, skilled)
+    _, eer_random = eer_threshold(genuine, random)
+    return {
+        "far_skilled_at_threshold": far_skilled,
+        "far_random_at_threshold": far_random,
+        "frr_at_threshold": frr,
+        "eer_skilled": eer_skilled,
+        "eer_random": eer_random,
+        "genuine_queries": int(len(genuine)),
+        "skilled_forgeries": int(len(skilled)),
+        "random_pairs": int(len(random)),
+    }
 
 
 def main() -> None:
@@ -111,6 +91,22 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument(
+        "--fusion-config",
+        type=Path,
+        help="Fusion config written by training.fit_fusion; enables fused scoring.",
+    )
+    parser.add_argument(
+        "--fusion-report",
+        type=Path,
+        help="Optional path to also write the printed JSON report to disk.",
+    )
+    parser.add_argument(
+        "--max-random-queries",
+        type=int,
+        default=None,
+        help="Deterministic cap on random query pairs (default: use every pair).",
+    )
     args = parser.parse_args()
 
     root = (args.image_root or args.manifest.parent).resolve()
@@ -121,43 +117,90 @@ def main() -> None:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(args.device)
 
-    results = {}
+    scorer: FusionScorer | None = None
+    config = None
+    if args.fusion_config is not None:
+        config = load_fusion_config(args.fusion_config)
+        scorer = FusionScorer(config)
+        fitted_preprocessed = bool(config.metadata.get("already_preprocessed", True))
+        if fitted_preprocessed != bool(args.already_preprocessed):
+            print(
+                "warning: --already-preprocessed differs from the fusion config metadata; "
+                "handcrafted features may be computed on different pixels than during fitting"
+            )
+
+    deep: dict[str, dict[str, np.ndarray]] = {}
+    fused: dict[str, dict[str, np.ndarray]] = {}
     for name, splits in (("val", {"val", "validation"}), ("test", {"test"})):
-        records = _read_split(args.manifest, root, splits)
-        embeddings = _embed(
-            model, records, args.already_preprocessed, args.device, args.batch_size, args.workers
+        records = read_split(args.manifest, root, splits)
+        embeddings = embed_records(
+            model,
+            records,
+            already_preprocessed=args.already_preprocessed,
+            device=args.device,
+            batch_size=args.batch_size,
+            workers=args.workers,
         )
-        results[name] = _scores(records, embeddings, args.references)
+        # Descriptors are only needed when fusion is active; skip the cost otherwise.
+        descriptors = (
+            describe_records(records, already_preprocessed=args.already_preprocessed)
+            if scorer is not None
+            else []
+        )
+        scores = _evaluate_split(
+            records,
+            embeddings,
+            descriptors,
+            args.references,
+            scorer,
+            args.max_random_queries,
+        )
+        deep[name] = {key: value for key, value in scores.items() if key.startswith("deep_")}
+        if scorer is not None:
+            fused[name] = {
+                key: value for key, value in scores.items() if key.startswith("fused_")
+            }
 
     # Threshold from validation signers; "skilled" is the harder and more relevant case.
-    val_gen, val_skilled, val_random = results["val"]
-    threshold, val_eer = _eer_threshold(val_gen, val_skilled)
-
-    test_gen, test_skilled, test_random = results["test"]
-    _, test_eer_skilled = _eer_threshold(test_gen, test_skilled)
-    _, test_eer_random = _eer_threshold(test_gen, test_random)
-    far_skilled, frr = _rates(test_gen, test_skilled, threshold)
-    far_random, _ = _rates(test_gen, test_random, threshold)
-
-    print(
-        json.dumps(
-            {
-                "threshold_from_validation": threshold,
-                "validation_eer_skilled": val_eer,
-                "test": {
-                    "far_skilled_at_threshold": far_skilled,
-                    "far_random_at_threshold": far_random,
-                    "frr_at_threshold": frr,
-                    "eer_skilled": test_eer_skilled,
-                    "eer_random": test_eer_random,
-                    "genuine_queries": len(test_gen),
-                    "skilled_forgeries": len(test_skilled),
-                    "random_pairs": len(test_random),
-                },
-            },
-            indent=2,
-        )
+    threshold, val_eer = eer_threshold(
+        deep["val"]["deep_genuine"], deep["val"]["deep_skilled"]
     )
+    report: dict[str, object] = {
+        "threshold_from_validation": threshold,
+        "validation_eer_skilled": val_eer,
+        "test": _metrics(deep["test"], "deep", threshold),
+    }
+
+    if scorer is not None and config is not None:
+        fused_threshold, fused_val_eer = eer_threshold(
+            fused["val"]["fused_genuine"], fused["val"]["fused_skilled"]
+        )
+        # Prefer the threshold the fitter measured out-of-fold; fall back to the
+        # validation EER when the config carries no calibrated threshold.
+        if config.threshold is not None:
+            applied = float(config.threshold)
+            threshold_source = "fusion_config_out_of_fold"
+        else:
+            applied = fused_threshold
+            threshold_source = "validation_eer"
+        report["fusion"] = {
+            "config": str(Path(args.fusion_config).expanduser().resolve()),  # type: ignore[union-attr]
+            "type": config.type,
+            "features": list(config.features),
+            "dropped_features": list(config.dropped_features),
+            "threshold_from_validation": fused_threshold,
+            "threshold_used": applied,
+            "threshold_source": threshold_source,
+            "validation_eer_skilled": fused_val_eer,
+            "test": _metrics(fused["test"], "fused", applied),
+        }
+
+    text = json.dumps(report, indent=2)
+    print(text)
+    if args.fusion_report is not None:
+        destination = Path(args.fusion_report).expanduser().resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(text + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
