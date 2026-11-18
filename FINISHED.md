@@ -257,49 +257,23 @@ This validates the training CLI and checkpoint writing; it does not produce a us
 ## 5. Kaggle: commands and setup
 
 Kaggle gives you a free GPU (T4 x2 or P100), which is what this pipeline needs. The
-`data/` and `checkpoints/` folders are gitignored, so on Kaggle you clone the code and
-build the data yourself.
+`data/` and `checkpoints/` folders are gitignored, so the dataset never travels through
+git. Preprocessing is therefore done **once, locally** (§5.1), the result is uploaded as a
+**Kaggle dataset** (§5.2), and each notebook simply attaches it read-only (§5.4). A new
+Kaggle session never re-stages raw `.tif` files and never re-runs the 10–20 min
+preprocessing pass.
 
-### 5.1 One-time setup in the notebook
+### 5.1 Preprocess locally (once, on your own machine)
 
-```python
-# Cell 1 — clone the repo and install only what Kaggle is missing.
-# Kaggle images already ship torch/torchvision; reinstalling them wastes ~2 GB and time.
-!git clone https://github.com/acharyayush/Signature-Verification-FIRST-.git /kaggle/working/repo
-%cd /kaggle/working/repo
-!pip install -q --no-input timm opencv-python scikit-learn albumentations
-
-# Cell 2 — verify the checkout and the GPU
-import torch, sys
-print("torch", torch.__version__, "cuda", torch.cuda.is_available(),
-      torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu")
-print(sys.version)
-```
-
-### 5.2 Add the dataset
-
-In the notebook UI use **Add Data** and attach a BHSig260 dataset (e.g.
-`bhsig260-bengali-hindi`). Then stage it into the layout `build_manifests.py` expects:
+Stage 2.2 is CPU work and only ever needs to happen once. Run it here, not on Kaggle:
 
 ```bash
-# Cell 3 — data/raw/BHSig260/<dataset_dir>/*.tif  with Genuine/ and Forged/ subfolders
-mkdir -p data/raw/BHSig260 data/manifests
-cp -r /kaggle/input/*/BHSig260-Bengali data/raw/BHSig260/ 2>/dev/null || true
-cp -r /kaggle/input/*/BHSig260-Hindi   data/raw/BHSig260/ 2>/dev/null || true
-ls data/raw/BHSig260
-find data/raw/BHSig260 -name '*.tif' | head -3
-find data/raw/BHSig260 -name '*.tif' | wc -l
-```
-
-The filenames must look like `B-S-1-G-01.tif` (or `H-S-1-F-01.tif`) and every forgery
-must sit in a folder literally named `Forged`/`forged` — `build_manifests.py` raises
-`ValueError` if the folder and the filename disagree, which is what keeps labels honest.
-
-### 5.3 Build the manifest and preprocess
-
-```bash
-# Cell 4 — per-dataset manifests + merged data/manifest.csv, then 192x384 PNGs
+# Local — (re)build the merged manifest from the raw dataset in data/raw/
+# data/manifests/ must exist first: build_manifests.py writes there when it runs
+mkdir -p data/manifests
 python -m preprocessing.build_manifests
+
+# Local — raw .tif -> 192x384 PNGs + data/processed/manifest.csv (~10-20 min for 16.6k)
 python -m preprocessing.preprocess_dataset \
   --manifest data/manifest.csv \
   --output-dir data/processed
@@ -315,12 +289,108 @@ print('signers', len({r['signer_id'] for r in rows}))
 "
 ```
 
-### 5.4 Train the Stage 3 encoder
+Two things to know about the manifest step:
+
+* `preprocessing/build_manifests.py` builds only the **BHSig260** rows, then merges every
+  `*.csv` in `data/manifests/` into `data/manifest.csv`. There is no CEDAR builder in this
+  repo, so if your manifest holds CEDAR rows (the current one does —
+  `raw/cedar/full_org/*.png`), make sure that CEDAR CSV is back in `data/manifests/` before
+  rebuilding, or the merge silently drops CEDAR.
+* If `data/manifest.csv` is already the file you want, skip the first two commands and start
+  at `preprocess_dataset`.
+
+Then package a **flat** upload zip: `manifest.csv` sits at the archive root and the image
+folders (`BHSig260/`, `cedar/`) sit next to it. That layout matters — the processed
+manifest's `image_path` values are relative to the processed directory, so a flat archive
+means the paths resolve as-is once the archive is mounted on Kaggle:
 
 ```bash
-# Cell 5 — ~25 epochs on a T4. Reduce epochs for a first pass if you are time-limited.
-python -m training.train_siamese \
-  --manifest data/processed/manifest.csv \
+# Local — flat, upload-ready zip (~30 MB; no data/ prefix, no .DS_Store)
+python - <<'PY'
+import zipfile
+from pathlib import Path
+
+src, out = Path("data/processed").resolve(), Path("data/processed-upload.zip")
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+    zf.write(src / "manifest.csv", "manifest.csv")
+    for path in sorted(src.rglob("*.png")):
+        zf.write(path, path.relative_to(src).as_posix())
+print("wrote", out, round(out.stat().st_size / 2**20, 1), "MiB")
+PY
+ls -lh data/processed-upload.zip
+```
+
+`data/` is gitignored, so neither the PNGs nor this zip are ever committed; the zip is
+only a transport artifact for Kaggle.
+
+### 5.2 Upload the preprocessed dataset to Kaggle (once)
+
+1. On kaggle.com: **Datasets → New Dataset**.
+2. Upload `data/processed-upload.zip`. Kaggle extracts archives on upload, so the dataset
+   contents end up exactly as the archive: `manifest.csv`, `BHSig260/`, `cedar/`.
+   (Uploading the ~16.6k individual PNGs through the browser also works, but is slower.)
+3. Name it e.g. `signature-verification-processed` and keep it **private**.
+4. Once created, the dataset mounts read-only at
+   `/kaggle/input/signature-verification-processed/`.
+
+No copying step is needed afterwards: the manifest uses paths relative to itself and
+`--image-root` defaults to the manifest's directory
+(`training/stage3_metric_learning.load_manifest`), so pointing `--manifest` straight at the
+mounted CSV resolves every image under `/kaggle/input/...`. `/kaggle/input` is read-only,
+which is fine — training only reads the dataset and writes to `checkpoints/` inside the
+cloned repo.
+
+### 5.3 One-time setup in the notebook
+
+```python
+# Cell 1 — clone the repo and install only what Kaggle is missing.
+# Kaggle images already ship torch/torchvision; reinstalling them wastes ~2 GB and time.
+!git clone https://github.com/acharyayush/Signature-Verification-FIRST-.git /kaggle/working/repo
+%cd /kaggle/working/repo
+!pip install -q --no-input timm opencv-python scikit-learn albumentations
+
+# Cell 2 — verify the checkout and the GPU
+import torch, sys
+print("torch", torch.__version__, "cuda", torch.cuda.is_available(),
+      torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu")
+print(sys.version)
+```
+
+### 5.4 Attach the dataset and verify it
+
+In the notebook UI use **Add Data → Your Datasets** and attach
+`signature-verification-processed`. Then define its path once — every later cell reuses it
+through Jupyter's `{VAR}` shell interpolation, which is why the remaining cells
+(`--manifest {PROCESSED}/manifest.csv`) stay readable.
+
+```python
+# Cell 3 — point at the attached preprocessed dataset
+PROCESSED = "/kaggle/input/signature-verification-processed"
+!ls -la {PROCESSED}
+!head -3 {PROCESSED}/manifest.csv
+
+# Cell 4 — confirm counts and that every relative image path actually resolves
+import csv, collections
+from pathlib import Path
+
+root = Path(PROCESSED)
+rows = list(csv.DictReader((root / 'manifest.csv').open()))
+print('rows', len(rows))
+print('splits', collections.Counter(r['split'] for r in rows))
+print('signers', len({r['signer_id'] for r in rows}))
+missing = [r['image_path'] for r in rows if not (root / r['image_path']).exists()]
+print('missing images', len(missing), missing[:3])
+```
+
+Expected for the current dataset: `rows 16632`, `Counter({'train': 11652, 'test': 2490,
+'val': 2490})`, `314` signers, `missing images 0`.
+
+### 5.5 Train the Stage 3 encoder
+
+```python
+# Cell 5 — ~25 epochs on a T4; the manifest lives in the attached dataset.
+!python -m training.train_siamese \
+  --manifest {PROCESSED}/manifest.csv \
   --already-preprocessed \
   --output-dir checkpoints/stage3 \
   --device cuda \
@@ -336,13 +406,13 @@ python -m training.train_siamese \
 Best weights land in `checkpoints/stage3/best_model.pt`. If you hit CUDA OOM, lower
 `--signers-per-batch` to 8 (that is 8 signers × 6 images = 48 images per batch).
 
-### 5.5 Fit the fusion config on validation
+### 5.6 Fit the fusion config on validation
 
-```bash
+```python
 # Cell 6 — fits both rules, keeps the lower out-of-fold EER. Validation split only.
-python -m training.fit_fusion \
+!python -m training.fit_fusion \
   --checkpoint checkpoints/stage3/best_model.pt \
-  --manifest data/processed/manifest.csv \
+  --manifest {PROCESSED}/manifest.csv \
   --already-preprocessed \
   --references 5 \
   --device cuda \
@@ -352,13 +422,13 @@ python -m training.fit_fusion \
   --output checkpoints/fusion/fusion.json
 ```
 
-### 5.6 Evaluate deep vs fused on the test split
+### 5.7 Evaluate deep vs fused on the test split
 
-```bash
+```python
 # Cell 7 — one run prints the deep baseline block and the fusion block side by side.
-python -m training.evaluate \
+!python -m training.evaluate \
   --checkpoint checkpoints/stage3/best_model.pt \
-  --manifest data/processed/manifest.csv \
+  --manifest {PROCESSED}/manifest.csv \
   --already-preprocessed \
   --references 5 \
   --device cuda \
@@ -367,40 +437,63 @@ python -m training.evaluate \
   --fusion-report checkpoints/fusion/report.json
 ```
 
-### 5.7 Persist the artifacts
+### 5.8 Persist the artifacts
 
-`/kaggle/working` is what gets saved as the notebook output. `checkpoints/` is gitignored,
-so copy what you want to keep into the working directory root or into a tarball:
+`/kaggle/working` is what Kaggle saves as notebook output. `checkpoints/` is gitignored,
+so copy what you want to keep into `/kaggle/working` or package it into a tarball.
+Run this in a Kaggle Python cell; `%cd /kaggle/working/repo` from Cell 1 ensures relative
+paths resolve correctly:
 
-```bash
+```python
 # Cell 8
-tar -czf /kaggle/working/artifacts.tar.gz \
+%cd /kaggle/working/repo
+
+!ls -lh \
   checkpoints/stage3/best_model.pt \
   checkpoints/fusion/fusion.json \
   checkpoints/fusion/report.json
-ls -lh /kaggle/working/artifacts.tar.gz
+!tar -czf /kaggle/working/artifacts.tar.gz \
+  /kaggle/working/repo/checkpoints/stage3/best_model.pt \
+  /kaggle/working/repo/checkpoints/fusion/fusion.json \
+  /kaggle/working/repo/checkpoints/fusion/report.json
+!ls -lh /kaggle/working/artifacts.tar.gz
 ```
 
-### 5.8 Run the tests on Kaggle too
+### 5.9 Run the tests on Kaggle too
 
 ```bash
 # Cell 9 — confirms the repo is intact in the Kaggle image
 python -m unittest discover -s tests -t .
 ```
 
-### 5.9 Kaggle gotchas
+### 5.10 Kaggle gotchas
 
 * **Do not `pip install -r requirements.txt`** on Kaggle — it will try to reinstall
   torch/torchvision and can break the preinstalled CUDA build. Install only the extras.
-* **`data/` is gitignored.** After a session restart you must re-stage the dataset and
-  re-run Cells 3–4 (or commit the generated `data/processed/manifest.csv` into a dataset
-  of your own and attach it).
-* **`build_manifests.py` needs `data/manifests/` to exist** — hence the `mkdir -p` in
-  Cell 3. It also runs at import time (it is a script, not an argparse CLI).
-* **Session limits.** 12 h on GPU notebooks. Preprocessing ~13k images is roughly
-  10–20 min; 25 training epochs is the long pole. Save checkpoints as you go.
-* **Determinism.** `--seed 42` is threaded through; keep it fixed across runs you intend
-  to compare.
+* **`/kaggle/input` is read-only.** That is why the pipeline reads the dataset in place and
+  only ever writes to `checkpoints/` inside the cloned repo. Never `cp` the dataset into the
+  repo "to be safe" — it doubles disk usage and buys nothing, because `--manifest` already
+  resolves the images from the dataset itself.
+* **`data/` and `checkpoints/` are gitignored.** The notebook therefore starts with no data
+  and no data is rebuilt on Kaggle; the attached dataset is the only copy. If you re-run
+  the local preprocessing (new images, new split seed), produce a fresh
+  `data/processed-upload.zip`, create a new **dataset version**, and the mounted path
+  `/kaggle/input/signature-verification-processed` still works unchanged.
+* **`build_manifests.py` needs `data/manifests/` to exist** — it is a script, not an
+  `argparse` CLI, and it raises `FileNotFoundError` on `data/manifests/bhsig260.csv` if the
+  folder is missing. Hence the `mkdir -p` in §5.1. This only affects the local
+  preprocessing step; Kaggle never runs it.
+* **Session limits.** 12 h on GPU notebooks. Preprocessing is no longer part of the session;
+  25 training epochs is the long pole. Save checkpoints as you go (Cell 8).
+* **Determinism.** `--seed 42` is threaded through both the manifest split and training,
+  and CPU/supported CUDA training enables deterministic Torch algorithms. Keep the seed,
+  manifest, preprocessing flags, device, and software versions fixed across runs;
+  MPS cannot guarantee bit-for-bit reproducibility, so use CPU when exact reruns matter.
+* **Local vs Kaggle preprocessing must match.** `--already-preprocessed` tells the training
+  and evaluation code the pixels are Stage 2.2 output and skips re-preprocessing. Dropping
+  the flag while feeding it processed PNGs silently doubles the preprocessing (resize of an
+  already-resized crop). The dataset uploaded in §5.2 is always Stage 2.2 output, so keep
+  the flag on every Kaggle command.
 
 
 

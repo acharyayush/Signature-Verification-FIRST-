@@ -164,6 +164,12 @@ Useful options:
 --seed N                          Random seed (default 42)
 ```
 
+For repeatable training, keep the seed, manifest, preprocessing flags, device, and
+software versions unchanged. CPU and supported CUDA runs enable deterministic Torch
+algorithms; MPS does not guarantee bit-for-bit reproducibility, so use `--device cpu`
+when exact reruns are required. Evaluation itself is deterministic for a fixed
+checkpoint and matching preprocessing options.
+
 For example, to run a quick CPU trial without downloading ImageNet weights:
 
 ```bash

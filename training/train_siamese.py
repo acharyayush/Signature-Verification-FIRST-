@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
+import warnings
 from pathlib import Path
 from typing import Literal
 
@@ -79,12 +81,27 @@ def _run_epoch(
     return {name: value / batch_count for name, value in totals.items()}
 
 
-def _set_seed(seed: int) -> None:
+def _set_seed(seed: int, device: torch.device) -> None:
+    # This must be set before CUDA work starts. It makes cuBLAS reductions
+    # deterministic on supported CUDA versions.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
+    elif device.type == "mps":
+        warnings.warn(
+            "MPS does not guarantee deterministic training; use --device cpu "
+            "or a deterministic CUDA setup for repeatable results.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    else:
+        torch.use_deterministic_algorithms(True)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -122,7 +139,8 @@ def main() -> None:
     if args.margin <= 0:
         raise ValueError("margin must be positive")
 
-    _set_seed(args.seed)
+    device = _device_from_argument(args.device)
+    _set_seed(args.seed, device)
     train_records, validation_records = load_manifest(args.manifest, args.image_root)
     all_signers = sorted(
         {record.signer_id for record in train_records + validation_records}
@@ -188,7 +206,6 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    device = _device_from_argument(args.device)
     print(f"Using device: {device}")
     model = SiameseSignatureModel(pretrained=not args.no_pretrained).to(device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
