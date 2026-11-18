@@ -408,7 +408,7 @@ python -m unittest discover -s tests -t .
 
 ## 6. Next steps
 
-In priority order:
+### 6.1 Priority list
 
 1. **Train a real checkpoint on a GPU.** Everything so far used a random-init model, so
    there are no meaningful quality numbers yet. Run Cell 5 on Kaggle with the full
@@ -434,7 +434,7 @@ In priority order:
 8. **Wire up the upstream stages.** Stages 1 and 2.1 (detection + artifact cleaning) are
    still outside this repo; the fusion path assumes a clean crop.
 
-### Known limitations to keep in the write-up
+### 6.2 Caveats to state when reporting results
 
 * The fusion features are hand-designed and were only smoke-tested; their real value on
   skilled forgeries is unproven until a trained checkpoint is evaluated.
@@ -479,23 +479,23 @@ python -m training.evaluate \
 
 ---
 
-## 6. What is next
+## 8. Detailed next steps
 
 Ordered by value, not by effort.
 
-### 6.1 Train a real checkpoint (blocking everything else)
+### 8.1 Train a real checkpoint (blocking everything else)
 
 Everything downstream needs a trained model. The smoke run used a random-init network, so
 no quality number in this repo is meaningful yet. Run Cell 5 on Kaggle with the default
 25 epochs and record `best_model.pt` + the validation loss curve.
 
-### 6.2 Report the real deep-vs-fused comparison
+### 8.2 Report the real deep-vs-fused comparison
 
 Once the checkpoint exists, run Cells 6–7 and put the four numbers in the README table:
 `eer_skilled` and `eer_random` for the deep baseline and for the fused scorer. The fusion
 path only earns its place if `eer_skilled` drops without `eer_random` collapsing.
 
-### 6.3 Calibrate the operating threshold
+### 8.3 Calibrate the operating threshold
 
 The fused threshold is currently the EER point from signer-grouped CV. For a cheque
 workflow the operating point should be chosen from a cost model: a false accept on a
@@ -503,21 +503,21 @@ cheque is far more expensive than a false reject routed to a human. Add a small
 `--target-far` option to `training/evaluate.py` that reports FRR at a fixed FAR, so the
 threshold can be set to a business constraint rather than the EER point.
 
-### 6.4 Per-signer threshold analysis
+### 8.4 Per-signer threshold analysis
 
 EER hides a lot. Some signers are much easier than others. Add a per-signer FAR/FRR
 breakdown to the report so a few hard signers cannot be averaged away. This is also the
 cheapest way to find preprocessing failures (a signer with FAR ≈ 1.0 is usually a data
 problem, not a model problem).
 
-### 6.5 Close the loop on the upstream stages
+### 8.5 Close the loop on the upstream stages
 
 Stages 1 and 2.1 (detection, artifact cleaning) are outside this repo. Until they are
 wired in, the pipeline is only valid on already-cropped, already-cleaned signatures. The
 next integration step is a thin adapter that takes a YOLO crop and hands it to
 `preprocess_signature`, so the same code path runs in production and in evaluation.
 
-### 6.6 Optional: score calibration
+### 8.6 Optional: score calibration
 
 Cosine similarity is not a probability. If a downstream system needs a probability, fit a
 Platt/isotonic calibrator on validation scores and store it next to the fusion config.
@@ -525,7 +525,7 @@ This is deliberately out of scope for now — the fusion threshold is already fi
 validation, and adding a calibrator without a cost model would just add a second
 unvalidated mapping.
 
-### 6.7 Optional: more features
+### 8.7 Optional: more features
 
 The nine features are cheap and interpretable. If 6.2 shows the fused model is limited by
 the handcrafted branch, the next candidates are curvature/loop statistics and
@@ -534,7 +534,7 @@ measured gap there is no way to know whether the feature helps.
 
 ---
 
-## 7. Definition of done for this change set
+## 9. Definition of done for this change set
 
 - [x] `scoring/` module with 9 handcrafted features and two fusion rules
 - [x] `training/fit_fusion.py` fitting on validation with signer-grouped CV
@@ -550,7 +550,7 @@ threshold calibration, upstream stages 1–2.1.
 
 ---
 
-## 8. Limitations to keep in mind
+## 10. Limitations to keep in mind
 
 * The repository ships **no data and no weights**. `data/` and `checkpoints/` are
   gitignored; you must supply a manifest.
