@@ -180,6 +180,15 @@ def main() -> None:
                 "warning: --already-preprocessed differs from the fusion config metadata; "
                 "handcrafted features may be computed on different pixels than during fitting"
             )
+        # The stored threshold is calibrated in the query space produced by the fitted
+        # reference count, so a mismatch silently applies it to a different protocol.
+        fitted_references = config.metadata.get("references")
+        if fitted_references is not None and int(fitted_references) != args.references:
+            print(
+                f"warning: the fusion config was fitted with --references {fitted_references} "
+                f"but evaluation uses --references {args.references}; the stored threshold is "
+                "calibrated for the fitted protocol and will not transfer"
+            )
 
     # A fusion config fitted with --normalize-hand dataset carries the per-dataset
     # standardisation statistics. Rebuilding the normalizer from the config guarantees the
