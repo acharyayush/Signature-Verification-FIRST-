@@ -25,21 +25,25 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Mapping, Sequence
 
 import numpy as np
 import torch
 
 from scoring.fusion import (
+    HAND_NORMALIZATION_KEY,
     Enrollment,
     FusionScorer,
+    HandNormalizer,
     enroll_and_build_queries,
     load_fusion_config,
     score_queries,
 )
 from scoring.handcrafted_features import describe_records
-from scoring.metrics import eer_threshold, rates_at_threshold
+from scoring.metrics import eer_threshold, rates_at_threshold, threshold_at_far
 from training.stage3_metric_learning import (
     SiameseSignatureModel,
+    dataset_labels,
     embed_records,
     read_split,
 )
@@ -52,12 +56,25 @@ def _evaluate_split(
     references: int,
     scorer: FusionScorer | None,
     max_random_queries: int | None,
+    datasets: Sequence[str] | None = None,
+    hand_normalizer: HandNormalizer | None = None,
+    dataset_of: Mapping[str, str] | None = None,
 ) -> dict[str, np.ndarray]:
     """Run the reference protocol and return deep (and fused) scores by query kind."""
     enrollment: Enrollment = enroll_and_build_queries(
-        records, references, max_random_queries=max_random_queries
+        records,
+        references,
+        max_random_queries=max_random_queries,
+        dataset_of=dataset_of,
     )
-    return score_queries(embeddings, descriptors or [], enrollment, scorer)
+    return score_queries(
+        embeddings,
+        descriptors or [],
+        enrollment,
+        scorer,
+        datasets=datasets,
+        hand_normalizer=hand_normalizer,
+    )
 
 
 def _metrics(scores: dict[str, np.ndarray], prefix: str, threshold: float) -> dict[str, object]:
@@ -107,7 +124,42 @@ def main() -> None:
         default=None,
         help="Deterministic cap on random query pairs (default: use every pair).",
     )
+    parser.add_argument(
+        "--target-far",
+        type=float,
+        default=None,
+        help=(
+            "Pick the decision threshold as the largest one whose FAR on the validation "
+            "skilled forgeries is at most this value (e.g. 0.03). Because FAR falls and "
+            "FRR rises with the threshold, this also minimises FRR subject to the FAR "
+            "budget. Default: choose the threshold at the equal-error point."
+        ),
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Use this fixed score threshold on test data instead of deriving one from validation.",
+    )
+    parser.add_argument(
+        "--random-negatives",
+        choices=("within-dataset", "all"),
+        default="within-dataset",
+        help=(
+            "Which signers the random (impostor) negatives come from. 'within-dataset' "
+            "(default) uses only other signers of the same dataset, so the random-forgery "
+            "rate measures within-script impostors. 'all' uses every other signer, which "
+            "mixes in cross-script pairs that are trivially separable and makes the rate "
+            "look far better than it is (the previous behaviour)."
+        ),
+    )
     args = parser.parse_args()
+    if args.target_far is not None and not 0.0 <= args.target_far <= 1.0:
+        raise ValueError("--target-far must be in [0, 1]")
+    if args.threshold is not None and not 0.0 <= args.threshold <= 1.0:
+        raise ValueError("--threshold must be in [0, 1]")
+    if args.threshold is not None and args.target_far is not None:
+        raise ValueError("--threshold and --target-far are mutually exclusive")
 
     root = (args.image_root or args.manifest.parent).resolve()
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
@@ -129,6 +181,20 @@ def main() -> None:
                 "handcrafted features may be computed on different pixels than during fitting"
             )
 
+    # A fusion config fitted with --normalize-hand dataset carries the per-dataset
+    # standardisation statistics. Rebuilding the normalizer from the config guarantees the
+    # test features are transformed with exactly the numbers used at fitting time.
+    hand_normalizer: HandNormalizer | None = None
+    if config is not None:
+        hand_normalizer = HandNormalizer.from_metadata(
+            config.metadata.get(HAND_NORMALIZATION_KEY)
+        )
+        if hand_normalizer is not None:
+            print(
+                "applying per-dataset handcrafted standardisation from the fusion config "
+                f"({len(hand_normalizer.mean)} datasets)"
+            )
+
     deep: dict[str, dict[str, np.ndarray]] = {}
     fused: dict[str, dict[str, np.ndarray]] = {}
     for name, splits in (("val", {"val", "validation"}), ("test", {"test"})):
@@ -147,6 +213,17 @@ def main() -> None:
             if scorer is not None
             else []
         )
+        # Dataset labels are needed for the per-dataset normalisation and for restricting
+        # random negatives to the same dataset.
+        needs_datasets = (
+            hand_normalizer is not None or args.random_negatives == "within-dataset"
+        )
+        datasets = dataset_labels(records, root) if needs_datasets else None
+        dataset_of = (
+            {record.signer_id: label for record, label in zip(records, datasets)}
+            if datasets is not None and args.random_negatives == "within-dataset"
+            else None
+        )
         scores = _evaluate_split(
             records,
             embeddings,
@@ -154,6 +231,9 @@ def main() -> None:
             args.references,
             scorer,
             args.max_random_queries,
+            datasets=datasets,
+            hand_normalizer=hand_normalizer,
+            dataset_of=dataset_of,
         )
         deep[name] = {key: value for key, value in scores.items() if key.startswith("deep_")}
         if scorer is not None:
@@ -162,28 +242,61 @@ def main() -> None:
             }
 
     # Threshold from validation signers; "skilled" is the harder and more relevant case.
-    threshold, val_eer = eer_threshold(
-        deep["val"]["deep_genuine"], deep["val"]["deep_skilled"]
-    )
+    # With --target-far the threshold is the largest one whose FAR on the validation
+    # skilled forgeries meets the budget, which also minimises FRR subject to it.
+    validation_genuine = deep["val"]["deep_genuine"]
+    validation_skilled = deep["val"]["deep_skilled"]
+    _, validation_eer = eer_threshold(validation_genuine, validation_skilled)
+    if args.threshold is not None:
+        threshold = float(args.threshold)
+        validation_far = None
+        threshold_source = "fixed"
+    elif args.target_far is not None:
+        threshold, validation_far = threshold_at_far(validation_skilled, args.target_far)
+        threshold_source = "validation_target_far"
+    else:
+        threshold = float(eer_threshold(validation_genuine, validation_skilled)[0])
+        validation_far = None
+        threshold_source = "validation_eer"
     report: dict[str, object] = {
         "threshold_from_validation": threshold,
-        "validation_eer_skilled": val_eer,
+        "threshold_source": threshold_source,
+        "validation_eer_skilled": validation_eer,
+        "random_negative_scope": args.random_negatives,
         "test": _metrics(deep["test"], "deep", threshold),
     }
+    if validation_far is not None:
+        report["target_far"] = args.target_far
+        report["validation_far_skilled_at_threshold"] = validation_far
 
     if scorer is not None and config is not None:
-        fused_threshold, fused_val_eer = eer_threshold(
-            fused["val"]["fused_genuine"], fused["val"]["fused_skilled"]
-        )
+        fused_genuine = fused["val"]["fused_genuine"]
+        fused_skilled = fused["val"]["fused_skilled"]
+        _, fused_val_eer = eer_threshold(fused_genuine, fused_skilled)
+        if args.threshold is not None:
+            fused_threshold = float(args.threshold)
+            fused_val_far = None
+        elif args.target_far is not None:
+            fused_threshold, fused_val_far = threshold_at_far(
+                fused_skilled, args.target_far
+            )
+        else:
+            fused_threshold = float(eer_threshold(fused_genuine, fused_skilled)[0])
+            fused_val_far = None
         # Prefer the threshold the fitter measured out-of-fold; fall back to the
-        # validation EER when the config carries no calibrated threshold.
-        if config.threshold is not None:
+        # validation split when the config carries no calibrated threshold.
+        if args.threshold is not None:
+            applied = float(args.threshold)
+            threshold_source = "fixed"
+        elif config.threshold is not None:
             applied = float(config.threshold)
             threshold_source = "fusion_config_out_of_fold"
         else:
             applied = fused_threshold
-            threshold_source = "validation_eer"
-        report["fusion"] = {
+            threshold_source = (
+                "validation_target_far" if args.target_far is not None else "validation_eer"
+            )
+        fusion_report: dict[str, object] = {
             "config": str(Path(args.fusion_config).expanduser().resolve()),  # type: ignore[union-attr]
             "type": config.type,
             "features": list(config.features),
@@ -194,6 +307,10 @@ def main() -> None:
             "validation_eer_skilled": fused_val_eer,
             "test": _metrics(fused["test"], "fused", applied),
         }
+        if fused_val_far is not None:
+            fusion_report["target_far"] = args.target_far
+            fusion_report["validation_far_skilled_at_threshold"] = fused_val_far
+        report["fusion"] = fusion_report
 
     text = json.dumps(report, indent=2)
     print(text)

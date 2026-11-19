@@ -16,10 +16,15 @@ import torch
 from torch.utils.data import DataLoader
 
 from preprocessing.signature_preprocessing import DEFAULT_TARGET_SIZE
+from scoring.fusion import enroll_and_build_queries, score_queries
+from scoring.metrics import eer_threshold
 from training.stage3_metric_learning import (
+    NegativePool,
     PKBatchSampler,
     SignatureDataset,
     SiameseSignatureModel,
+    dataset_labels,
+    embed_records,
     load_manifest,
     triplet_loss,
 )
@@ -41,10 +46,12 @@ def _run_epoch(
     mining: Literal["semi-hard", "batch-hard"],
     margin: float,
     optimizer: torch.optim.Optimizer | None = None,
+    negative_pool: NegativePool = "split",
+    forgery_weight: float = 1.0,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
-    totals = {"loss": 0.0, "mean_positive": 0.0, "mean_negative": 0.0, "active_fraction": 0.0}
+    totals: dict[str, float] = {"loss": 0.0}
     batch_count = 0
 
     for images, signer_ids, is_forgery in loader:
@@ -62,6 +69,8 @@ def _run_epoch(
                 is_forgery,
                 margin=margin,
                 mining=mining,
+                negative_pool=negative_pool,
+                forgery_weight=forgery_weight,
             )
             if training:
                 loss.backward()
@@ -72,13 +81,55 @@ def _run_epoch(
                 optimizer.step()
 
         totals["loss"] += loss.detach().item()
+        # ``get`` keeps this robust when ``triplet_loss`` starts reporting a new metric.
         for name, value in metrics.items():
-            totals[name] += value.item()
+            totals[name] = totals.get(name, 0.0) + value.item()
         batch_count += 1
 
     if batch_count == 0:
         raise RuntimeError("data loader produced no batches")
     return {name: value / batch_count for name, value in totals.items()}
+
+
+def _validation_eer(
+    model: SiameseSignatureModel,
+    validation_records,
+    *,
+    references: int,
+    already_preprocessed: bool,
+    ink: str,
+    device: torch.device,
+    batch_size: int,
+    workers: int,
+) -> float | None:
+    """Return the signer-disjoint validation EER on skilled forgeries, or ``None``.
+
+    This is the metric that is actually reported, so using it to pick the checkpoint stops
+    the triplet-loss scale from deciding the run. It reuses the shared protocol
+    (``embed_records`` + ``enroll_and_build_queries`` + ``score_queries``), so the number
+    logged here is computed exactly like the number in ``training.evaluate``.
+
+    Returns ``None`` when the validation split cannot be enrolled (too few genuine images
+    per signer), so the caller can fall back to the loss.
+    """
+    embeddings = embed_records(
+        model,
+        validation_records,
+        already_preprocessed=already_preprocessed,
+        device=device,
+        batch_size=batch_size,
+        workers=workers,
+    )
+    try:
+        enrollment = enroll_and_build_queries(validation_records, references)
+    except ValueError:
+        return None
+    scores = score_queries(embeddings, [], enrollment, None)
+    genuine = scores["deep_genuine"]
+    skilled = scores["deep_skilled"]
+    if genuine.size == 0 or skilled.size == 0:
+        return None
+    return float(eer_threshold(genuine, skilled)[1])
 
 
 def _set_seed(seed: int, device: torch.device) -> None:
@@ -123,6 +174,56 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--genuine-per-signer", type=int, default=4)
     parser.add_argument("--forgeries-per-signer", type=int, default=2)
     parser.add_argument("--margin", type=float, default=0.3)
+    parser.add_argument(
+        "--negative-pool",
+        choices=("split", "union"),
+        default="split",
+        help=(
+            "How the two negative kinds are mined. 'split' (default) mines the "
+            "cross-signer genuine pool and the same-signer forgery pool separately and "
+            "adds the losses, so more forgeries add signal. 'union' merges them and takes "
+            "the single closest negative, which lets forgeries crowd out the cross-signer "
+            "negatives that teach identity separation (the previous behaviour)."
+        ),
+    )
+    parser.add_argument(
+        "--forgery-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of the forgery term relative to the identity term under "
+            "--negative-pool split. The terms are combined as "
+            "(identity + w * forgery) / (1 + w), so the loss magnitude stays comparable "
+            "to an identity-only loss."
+        ),
+    )
+    parser.add_argument(
+        "--select-metric",
+        choices=("eer", "loss"),
+        default="eer",
+        help=(
+            "What the best checkpoint is chosen by. 'eer' (default) uses the signer-"
+            "disjoint validation EER on skilled forgeries -- the metric that is reported "
+            "-- which stops the triplet loss scale from deciding the run. 'loss' is the "
+            "previous behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--eval-references",
+        type=int,
+        default=2,
+        help="Enrolled references per signer when computing the validation EER.",
+    )
+    parser.add_argument(
+        "--balance-datasets",
+        action="store_true",
+        help=(
+            "Sample signers so every source dataset contributes an equal share of each "
+            "batch, instead of sampling signers uniformly. Without this, a dataset with "
+            "more signers dominates the gradient. Requires the manifest paths to sit "
+            "under --image-root."
+        ),
+    )
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -138,6 +239,10 @@ def main() -> None:
         raise ValueError("workers cannot be negative")
     if args.margin <= 0:
         raise ValueError("margin must be positive")
+    if args.forgery_loss_weight < 0:
+        raise ValueError("forgery-loss-weight cannot be negative")
+    if args.eval_references < 1:
+        raise ValueError("eval-references must be at least 1")
 
     device = _device_from_argument(args.device)
     _set_seed(args.seed, device)
@@ -146,6 +251,29 @@ def main() -> None:
         {record.signer_id for record in train_records + validation_records}
     )
     signer_to_index = {signer: index for index, signer in enumerate(all_signers)}
+
+    # Optional dataset-balanced signer sampling. Signers are otherwise sampled uniformly,
+    # so a dataset that holds more signers contributes proportionally more of every batch
+    # and its script dominates the gradient.
+    signer_groups: dict[str, str] = {}
+    if args.balance_datasets:
+        image_root = (
+            Path(args.image_root).expanduser().resolve()
+            if args.image_root
+            else Path(args.manifest).expanduser().resolve().parent
+        )
+        labels = dataset_labels(train_records + validation_records, image_root)
+        signer_groups = {
+            record.signer_id: label
+            for record, label in zip(train_records + validation_records, labels)
+        }
+        per_dataset: dict[str, int] = {}
+        for label in signer_groups.values():
+            per_dataset[label] = per_dataset.get(label, 0) + 1
+        print(
+            f"Dataset-balanced sampling over {len(per_dataset)} datasets: "
+            f"{sorted(per_dataset.items())}"
+        )
 
     train_dataset = SignatureDataset(
         train_records,
@@ -166,6 +294,7 @@ def main() -> None:
         genuine_per_signer=args.genuine_per_signer,
         forgeries_per_signer=args.forgeries_per_signer,
         seed=args.seed,
+        signer_groups=signer_groups,
     )
     validation_eligible_signers = {
         record.signer_id
@@ -191,6 +320,7 @@ def main() -> None:
         genuine_per_signer=2,
         forgeries_per_signer=args.forgeries_per_signer,
         seed=args.seed,
+        signer_groups=signer_groups,
     )
 
     train_loader = DataLoader(
@@ -210,13 +340,19 @@ def main() -> None:
     model = SiameseSignatureModel(pretrained=not args.no_pretrained).to(device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = args.output_dir / "best_model.pt"
-    best_validation_loss = math.inf
+    # The checkpoint is chosen by the metric that gets reported, not by the training
+    # objective: the triplet loss scale depends on the batch composition (how many
+    # forgeries, which signers, which script mix), so selecting on it makes a data-mix
+    # change look like a quality change.
+    best_selection_score = math.inf
+    best_selection_metric = "validation_loss"
 
     phases: list[tuple[str, int, float, Literal["semi-hard", "batch-hard"]]] = [
         ("warmup", args.phase1_epochs, 1e-3, "semi-hard"),
         ("fine_tune", args.phase2_epochs, 1e-4, "batch-hard"),
     ]
     global_epoch = 0
+    eer_unavailable = False
     for phase_name, epoch_count, learning_rate, mining in phases:
         if epoch_count == 0:
             continue
@@ -239,6 +375,8 @@ def main() -> None:
                 mining=mining,
                 margin=args.margin,
                 optimizer=optimizer,
+                negative_pool=args.negative_pool,
+                forgery_weight=args.forgery_loss_weight,
             )
             # Validate with batch-hard in every phase: semi-hard and batch-hard
             # losses are not comparable, which would skew best-checkpoint selection.
@@ -248,29 +386,62 @@ def main() -> None:
                 device,
                 mining="batch-hard",
                 margin=args.margin,
+                negative_pool=args.negative_pool,
+                forgery_weight=args.forgery_loss_weight,
             )
             global_epoch += 1
-            print(
-                json.dumps(
-                    {
-                        "phase": phase_name,
-                        "epoch": phase_epoch + 1,
-                        "train": train_metrics,
-                        "validation": validation_metrics,
-                    }
-                )
-            )
+            record: dict[str, object] = {
+                "phase": phase_name,
+                "epoch": phase_epoch + 1,
+                "train": train_metrics,
+                "validation": validation_metrics,
+            }
 
-            if validation_metrics["loss"] < best_validation_loss:
-                best_validation_loss = validation_metrics["loss"]
+            selection_score = validation_metrics["loss"]
+            selection_metric = "validation_loss"
+            if args.select_metric == "eer":
+                validation_eer = _validation_eer(
+                    model,
+                    validation_records,
+                    references=args.eval_references,
+                    already_preprocessed=args.already_preprocessed,
+                    ink=args.ink,
+                    device=device,
+                    batch_size=64,
+                    workers=args.workers,
+                )
+                if validation_eer is not None:
+                    record["validation_eer_skilled"] = validation_eer
+                    selection_score = validation_eer
+                    selection_metric = "validation_eer_skilled"
+                elif not eer_unavailable:
+                    # Say it once instead of silently selecting on the loss: a quiet
+                    # fallback is exactly how the forgery-count confound went unnoticed.
+                    eer_unavailable = True
+                    print(
+                        "warning: validation EER is unavailable (a validation signer has "
+                        f"at most {args.eval_references} genuine images); "
+                        "selecting on the triplet loss instead. Lower --eval-references."
+                    )
+            print(json.dumps(record))
+
+            if selection_score < best_selection_score:
+                best_selection_score = selection_score
+                best_selection_metric = selection_metric
                 torch.save(
                     {
                         "model_state_dict": model.state_dict(),
                         "embedding_dim": model.embedding_dim,
-                        "best_validation_loss": best_validation_loss,
+                        # Selection provenance: which metric chose this checkpoint and
+                        # what it scored, plus the epoch's validation loss for reference.
+                        "selection_metric": best_selection_metric,
+                        "selection_score": best_selection_score,
+                        "validation_loss": validation_metrics["loss"],
                         "epoch": global_epoch,
                         "phase": phase_name,
                         "seed": args.seed,
+                        "negative_pool": args.negative_pool,
+                        "forgery_loss_weight": args.forgery_loss_weight,
                         "preprocessing": {
                             "already_preprocessed": args.already_preprocessed,
                             "ink": args.ink,
@@ -280,7 +451,7 @@ def main() -> None:
                     checkpoint_path,
                 )
 
-    print(f"Best checkpoint: {checkpoint_path}")
+    print(f"Best checkpoint: {checkpoint_path} ({best_selection_metric}={best_selection_score:.4f})")
 
 
 if __name__ == "__main__":

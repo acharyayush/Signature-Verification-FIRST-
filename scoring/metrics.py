@@ -32,6 +32,64 @@ def rates_at_threshold(
     return false_acceptance_rate, false_rejection_rate
 
 
+def frr_at_threshold(
+    genuine: np.ndarray | list[float],
+    threshold: float,
+) -> float:
+    """Return the false-rejection rate for ``genuine`` at ``threshold``.
+
+    Split out from :func:`rates_at_threshold` because an operating point is often
+    chosen from the *negative* scores alone (see :func:`threshold_at_far`) and only
+    the resulting FRR is needed.
+    """
+    genuine_array = np.asarray(genuine, dtype=np.float64)
+    if genuine_array.size == 0:
+        raise ValueError("genuine score array must be non-empty")
+    return float((genuine_array < threshold).mean())
+
+
+def threshold_at_far(
+    negatives: np.ndarray | list[float],
+    target_far: float,
+) -> tuple[float, float]:
+    """Return the largest threshold whose FAR on ``negatives`` is at most ``target_far``.
+
+    EER is a summary statistic. A deployed system is usually specified as "accept at
+    most ``target_far`` of the impostors, then reject as few genuine users as
+    possible". Because FAR is non-increasing in the threshold and FRR is
+    non-decreasing, the threshold that satisfies the FAR budget *and* minimises FRR is
+    the largest one that still satisfies the budget. That is exactly what this returns,
+    along with the FAR actually achieved.
+
+    The decision rule everywhere in this repository is ``score >= threshold``, so the
+    threshold is set to the ``allowed``-th highest negative score: exactly ``allowed``
+    negatives are accepted, where ``allowed = floor(target_far * n_negatives)``.
+
+    Args:
+        negatives: Impostor scores, e.g. the validation split's skilled forgeries.
+        target_far: FAR budget in ``[0, 1]``.
+
+    Raises:
+        ValueError: If ``negatives`` is empty or ``target_far`` is outside ``[0, 1]``.
+    """
+    negative_array = np.asarray(negatives, dtype=np.float64)
+    if negative_array.size == 0:
+        raise ValueError("negative score array must be non-empty")
+    if not 0.0 <= target_far <= 1.0:
+        raise ValueError("target_far must be in [0, 1]")
+
+    descending = np.sort(negative_array)[::-1]
+    allowed = int(np.floor(target_far * descending.size))
+    if allowed <= 0:
+        # No impostor may be accepted, so sit just above the highest negative score.
+        return float(np.nextafter(descending[0], np.inf)), 0.0
+    if allowed >= descending.size:
+        return float(descending[-1]), 1.0
+    threshold = float(descending[allowed - 1])
+    far = float((negative_array >= threshold).mean())
+    return threshold, far
+
+
 def eer_threshold(
     genuine: np.ndarray | list[float],
     negatives: np.ndarray | list[float],

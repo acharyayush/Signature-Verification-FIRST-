@@ -140,6 +140,135 @@ class FusionConfig:
         )
 
 
+# Key under ``FusionConfig.metadata`` holding the optional per-dataset handcrafted
+# standardisation statistics. Metadata already round-trips through the JSON config, so
+# storing them there keeps the on-disk schema unchanged and old configs load fine.
+HAND_NORMALIZATION_KEY = "hand_normalization"
+
+
+@dataclass(frozen=True)
+class HandNormalizer:
+    """Per-dataset z-score of the handcrafted feature vector.
+
+    The nine handcrafted features are *absolute*: ink density, bounding-box aspect
+    ratio, ``1 - 0.5 * L1`` between projection profiles and the Hu-moment agreement.
+    Their typical value therefore depends on the script, so a Thai signature and a
+    Bengali signature do not share the same feature scale. One global fusion weight and
+    one global threshold are then not comparable across scripts, which is exactly the
+    situation a multi-script manifest creates.
+
+    Standardising each feature with the statistics of the dataset the pair belongs to
+    removes that level shift, so a single fusion weight and a single operating point
+    become meaningful across scripts.
+
+    ``mean`` and ``scale`` are keyed by dataset label and ordered like
+    :data:`FEATURE_NAMES`. A label with no entry is left untouched, so an unseen
+    dataset degrades to the unnormalised behaviour instead of raising.
+
+    Caveat: this needs the dataset label at scoring time. That is fine for a
+    per-dataset benchmark, but in deployment the label has to come from whatever
+    produced the manifest; otherwise the fused score is computed in a different space
+    than it was fitted in. This is why the feature is opt-in.
+    """
+
+    mean: Mapping[str, Sequence[float]]
+    scale: Mapping[str, Sequence[float]]
+
+    @classmethod
+    def fit(
+        cls,
+        hand_matrix: np.ndarray,
+        datasets: Sequence[str],
+        *,
+        names: Sequence[str] = FEATURE_NAMES,
+    ) -> "HandNormalizer":
+        """Return the per-dataset statistics of a ``(N, len(names))`` feature matrix."""
+        matrix = np.asarray(hand_matrix, dtype=np.float64)
+        labels = np.asarray(list(datasets), dtype=object)
+        if matrix.ndim != 2 or matrix.shape[1] != len(names):
+            raise ValueError("hand matrix shape does not match the feature name list")
+        if matrix.shape[0] != labels.shape[0]:
+            raise ValueError("hand matrix and dataset labels must have equal length")
+
+        mean: dict[str, tuple[float, ...]] = {}
+        scale: dict[str, tuple[float, ...]] = {}
+        for label in np.unique(labels):
+            rows = matrix[labels == label]
+            if rows.shape[0] < 2:
+                # A single row has no spread to estimate; leave that dataset alone
+                # rather than dividing by zero.
+                continue
+            row_scale = np.where(rows.std(axis=0) < 1e-12, 1.0, rows.std(axis=0))
+            mean[str(label)] = tuple(float(value) for value in rows.mean(axis=0))
+            scale[str(label)] = tuple(float(value) for value in row_scale)
+        return cls(mean=mean, scale=scale)
+
+    def transform(
+        self,
+        hand_matrix: np.ndarray,
+        datasets: Sequence[str],
+    ) -> np.ndarray:
+        """Return a copy of ``hand_matrix`` with each row standardised by its dataset."""
+        matrix = np.asarray(hand_matrix, dtype=np.float64).copy()
+        labels = np.asarray(list(datasets), dtype=object)
+        if matrix.shape[0] != labels.shape[0]:
+            raise ValueError("hand matrix and dataset labels must have equal length")
+        for label in np.unique(labels):
+            key = str(label)
+            if key not in self.mean:
+                continue
+            rows = labels == label
+            mean = np.asarray(self.mean[key], dtype=np.float64)
+            scale = np.asarray(self.scale[key], dtype=np.float64)
+            matrix[rows] = (matrix[rows] - mean) / scale
+        return matrix
+
+    def transform_features(
+        self,
+        features: Mapping[str, float],
+        dataset: str | None,
+        *,
+        names: Sequence[str] = FEATURE_NAMES,
+    ) -> dict[str, float]:
+        """Standardise one feature dict, returning it unchanged for an unknown dataset."""
+        key = None if dataset is None else str(dataset)
+        if key is None or key not in self.mean:
+            return dict(features)
+        mean = self.mean[key]
+        scale = self.scale[key]
+        return {
+            name: (float(features[name]) - mean[index]) / scale[index]
+            for index, name in enumerate(names)
+        }
+
+    def to_metadata(self) -> dict[str, object]:
+        """Return a JSON-serialisable form for ``FusionConfig.metadata``."""
+        return {
+            "mean": {key: list(value) for key, value in self.mean.items()},
+            "scale": {key: list(value) for key, value in self.scale.items()},
+        }
+
+    @classmethod
+    def from_metadata(cls, payload: object) -> "HandNormalizer | None":
+        """Rebuild from :meth:`to_metadata` output, or ``None`` when absent/invalid."""
+        if not isinstance(payload, Mapping):
+            return None
+        try:
+            mean = {
+                str(key): tuple(float(item) for item in value)
+                for key, value in dict(payload["mean"]).items()
+            }
+            scale = {
+                str(key): tuple(float(item) for item in value)
+                for key, value in dict(payload["scale"]).items()
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not mean or not scale:
+            return None
+        return cls(mean=mean, scale=scale)
+
+
 def save_fusion_config(config: FusionConfig, path: str | Path) -> Path:
     """Write ``config`` as indented JSON and return the resolved path."""
     destination = Path(path).expanduser().resolve()
@@ -484,6 +613,7 @@ def enroll_and_build_queries(
     *,
     max_random_queries: int | None = None,
     seed: int = 0,
+    dataset_of: Mapping[str, str] | None = None,
 ) -> Enrollment:
     """Enrol the first ``references`` genuine images per signer and list the queries.
 
@@ -498,6 +628,11 @@ def enroll_and_build_queries(
     subsample. Random negatives outnumber genuine queries by orders of magnitude on real
     manifests, so the cap keeps runtime reasonable while leaving the genuine and skilled
     sets untouched. ``None`` keeps every random pair, matching the original behaviour.
+
+    ``dataset_of`` optionally maps a signer id to its source dataset. When given, random
+    negatives are drawn only from signers of the *same* dataset, so the random-forgery rate
+    measures within-script impostors instead of being diluted by cross-script pairs that
+    are trivially separable. ``None`` keeps every other signer (the previous behaviour).
     """
     by_signer: dict[str, dict[str, list[int]]] = defaultdict(lambda: {"gen": [], "forg": []})
     for index, record in enumerate(records):
@@ -524,6 +659,10 @@ def enroll_and_build_queries(
         )
         for other, other_groups in by_signer.items():
             if other == signer_id:
+                continue
+            if dataset_of is not None and dataset_of.get(other) != dataset_of.get(signer_id):
+                # A different script is an impostor too, but one that is trivially easy to
+                # reject, so mixing it in hides the within-script impostor rate.
                 continue
             queries.extend(
                 Query(index=index, target_signer=signer_id, kind="random")
@@ -559,6 +698,9 @@ def score_queries(
     descriptors: Sequence[SignatureDescriptors],
     enrollment: Enrollment,
     scorer: FusionScorer | None = None,
+    *,
+    datasets: Sequence[str] | None = None,
+    hand_normalizer: HandNormalizer | None = None,
 ) -> dict[str, np.ndarray]:
     """Score every enrolled query and return deep and fused score arrays by kind.
 
@@ -568,11 +710,25 @@ def score_queries(
     and then averaged, so per-reference evidence is preserved; for the weighted mode this
     is mathematically identical to fusing the averaged scores.
 
+    Args:
+        embeddings: ``(N, D)`` L2-normalised embeddings indexed like the records.
+        descriptors: Per-record descriptors indexed like the records.
+        enrollment: Output of :func:`enroll_and_build_queries`.
+        scorer: Optional fusion rule; deep-only scores are returned without it.
+        datasets: Optional per-record dataset labels. Required by ``hand_normalizer``;
+            the *query's* label is used, because the query is the signature being
+            verified and per-dataset reporting groups by query.
+        hand_normalizer: Optional per-dataset handcrafted standardisation. It must be
+            applied here, before the scorer, so the fused score is computed in the same
+            space it was fitted in.
+
     Returns:
         A dict with ``deep_<kind>`` arrays always, plus ``fused_<kind>`` arrays when a
         scorer is supplied. Kinds are ``genuine``, ``skilled``, and ``random``.
     """
     embedding_array = np.asarray(embeddings, dtype=np.float64)
+    if hand_normalizer is not None and datasets is None:
+        raise ValueError("hand_normalizer requires per-record dataset labels")
     buckets: dict[str, dict[str, list[float]]] = {
         kind: {"deep": [], "fused": []} for kind in ("genuine", "skilled", "random")
     }
@@ -582,13 +738,14 @@ def score_queries(
         deep_scores = embedding_array[reference_indices] @ embedding_array[query.index]
         buckets[query.kind]["deep"].append(float(deep_scores.mean()))
         if scorer is not None:
-            pair_scores = [
-                scorer.score(
-                    float(deep_scores[position]),
-                    pair_features(descriptors[reference], descriptors[query.index]),
-                )
-                for position, reference in enumerate(reference_indices)
-            ]
+            pair_scores = []
+            for position, reference in enumerate(reference_indices):
+                features = pair_features(descriptors[reference], descriptors[query.index])
+                if hand_normalizer is not None:
+                    features = hand_normalizer.transform_features(
+                        features, datasets[query.index]
+                    )
+                pair_scores.append(scorer.score(float(deep_scores[position]), features))
             buckets[query.kind]["fused"].append(float(np.mean(pair_scores)))
 
     results: dict[str, np.ndarray] = {}
@@ -615,6 +772,7 @@ class PairMatrix:
     signers: np.ndarray
     kinds: np.ndarray
     query_ids: np.ndarray
+    datasets: np.ndarray | None = None
 
     def __len__(self) -> int:
         return int(self.deep.shape[0])
@@ -628,6 +786,23 @@ class PairMatrix:
             signers=self.signers[indices],
             kinds=self.kinds[indices],
             query_ids=self.query_ids[indices],
+            datasets=None if self.datasets is None else self.datasets[indices],
+        )
+
+    def with_hand(self, hand: np.ndarray) -> "PairMatrix":
+        """Return the same rows with a replaced handcrafted matrix.
+
+        Used to swap in a per-dataset standardised feature matrix (see
+        :class:`HandNormalizer`) without rebuilding the whole pair matrix.
+        """
+        return PairMatrix(
+            deep=self.deep,
+            hand=hand,
+            labels=self.labels,
+            signers=self.signers,
+            kinds=self.kinds,
+            query_ids=self.query_ids,
+            datasets=self.datasets,
         )
 
 
@@ -637,6 +812,8 @@ def build_pair_matrix(
     enrollment: Enrollment,
     *,
     names: Sequence[str] = FEATURE_NAMES,
+    datasets: Sequence[str] | None = None,
+    hand_normalizer: HandNormalizer | None = None,
 ) -> PairMatrix:
     """Expand an enrollment into one row per ``(reference, query)`` pair.
 
@@ -649,7 +826,14 @@ def build_pair_matrix(
         descriptors: Per-record descriptors indexed like the records.
         enrollment: Output of :func:`enroll_and_build_queries`.
         names: Handcrafted feature order for the ``hand`` matrix columns.
+        datasets: Optional per-record dataset labels, carried on the matrix so a
+            per-dataset threshold or standardisation can be applied later.
+        hand_normalizer: Optional per-dataset handcrafted standardisation, applied to
+            each row using the *query's* label so fitting sees the same feature space
+            as :func:`score_queries` does at evaluation time.
     """
+    if hand_normalizer is not None and datasets is None:
+        raise ValueError("hand_normalizer requires per-record dataset labels")
     embedding_array = np.asarray(embeddings, dtype=np.float64)
     deep_rows: list[float] = []
     hand_rows: list[np.ndarray] = []
@@ -657,18 +841,25 @@ def build_pair_matrix(
     signers: list[str] = []
     kinds: list[str] = []
     query_ids: list[int] = []
+    dataset_rows: list[str] = []
 
     for query in enrollment.queries:
         reference_indices = enrollment.references[query.target_signer]
         deep_scores = embedding_array[reference_indices] @ embedding_array[query.index]
         for position, reference in enumerate(reference_indices):
             features = pair_features(descriptors[reference], descriptors[query.index])
+            if hand_normalizer is not None:
+                features = hand_normalizer.transform_features(
+                    features, datasets[query.index]
+                )
             deep_rows.append(float(deep_scores[position]))
             hand_rows.append(np.array([features[name] for name in names], dtype=np.float64))
             labels.append(1 if query.kind == "genuine" else 0)
             signers.append(query.target_signer)
             kinds.append(query.kind)
             query_ids.append(query.query_index)
+            if datasets is not None:
+                dataset_rows.append(datasets[query.index])
 
     return PairMatrix(
         deep=np.asarray(deep_rows, dtype=np.float64),
@@ -677,4 +868,5 @@ def build_pair_matrix(
         signers=np.asarray(signers, dtype=object),
         kinds=np.asarray(kinds, dtype=object),
         query_ids=np.asarray(query_ids, dtype=np.int64),
+        datasets=np.asarray(dataset_rows, dtype=object) if dataset_rows else None,
     )

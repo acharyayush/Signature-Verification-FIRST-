@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import csv
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Literal, Sequence
+from typing import Iterator, Literal, Mapping, Sequence
 
 import numpy as np
 import timm
@@ -21,6 +22,9 @@ from preprocessing.signature_preprocessing import (
 )
 
 MiningMode = Literal["semi-hard", "batch-hard"]
+# ``split`` mines the identity and forgery negative pools separately; ``union`` merges them
+# into one pool and takes the single closest negative (the previous behaviour).
+NegativePool = Literal["split", "union"]
 
 
 @dataclass(frozen=True)
@@ -153,6 +157,49 @@ def read_split(
     return records
 
 
+def dataset_labels(
+    records: Sequence[SignatureRecord],
+    root: str | Path,
+    depth: int = 1,
+) -> list[str]:
+    """Return the source-dataset label of every record, derived from its path.
+
+    The manifest schema is ``image_path,signer_id,is_forgery,split``: it carries no
+    dataset column, so the dataset has to be recovered from the layout that
+    :mod:`preprocessing.preprocess_dataset` writes. For the processed layout
+    ``BHSig260/BHSig100_Bengali/Genuine/x.png`` a ``depth`` of 1 yields ``BHSig260``
+    and a ``depth`` of 2 yields ``BHSig260/BHSig100_Bengali``.
+
+    This is the single place that maps a record to a dataset, so the per-dataset
+    breakdown, the per-dataset fusion threshold and the per-dataset handcrafted
+    normalisation all agree on what "a dataset" is.
+
+    Args:
+        records: Manifest records with an absolute, resolved ``image_path``.
+        root: Directory the manifest paths resolve against (``--image-root``).
+        depth: Number of leading path components that identify a dataset.
+
+    Raises:
+        ValueError: If a record's path is not under ``root``. Guessing a label would
+            silently create bogus datasets, so the caller is asked to fix
+            ``--image-root`` instead.
+    """
+    image_root = Path(root).expanduser().resolve()
+    labels: list[str] = []
+    for record in records:
+        path = Path(record.image_path)
+        try:
+            relative = path.relative_to(image_root)
+        except ValueError as error:
+            raise ValueError(
+                f"image path {path} is not under --image-root {image_root}; "
+                "pass the directory the manifest paths resolve against"
+            ) from error
+        parts = relative.parts[:-1]  # drop the file name
+        labels.append("/".join(parts[:depth]) if parts else "unknown")
+    return labels
+
+
 class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
     """Load signatures, preprocess them, and return model-ready tensors and labels."""
 
@@ -201,6 +248,7 @@ class PKBatchSampler(Sampler[list[int]]):
         genuine_per_signer: int,
         forgeries_per_signer: int = 0,
         seed: int = 42,
+        signer_groups: Mapping[str, str] | None = None,
     ) -> None:
         if signers_per_batch < 2:
             raise ValueError("signers_per_batch must be at least 2")
@@ -232,6 +280,14 @@ class PKBatchSampler(Sampler[list[int]]):
                 f"{genuine_per_signer} genuine images; found {len(self.eligible_signers)}"
             )
 
+        # Optional dataset grouping, used to stop one dataset from dominating a batch.
+        self.signer_groups = dict(signer_groups or {})
+        self.grouped_signers: dict[str, list[str]] = {}
+        for signer in self.eligible_signers:
+            group = self.signer_groups.get(signer)
+            if group is not None:
+                self.grouped_signers.setdefault(group, []).append(signer)
+
     def __len__(self) -> int:
         # Number of batches per epoch; signers are sampled anew for each batch.
         return max(1, (len(self.eligible_signers) + self.signers_per_batch - 1) // self.signers_per_batch)
@@ -240,11 +296,39 @@ class PKBatchSampler(Sampler[list[int]]):
         """Change the deterministic sampling sequence for the next epoch."""
         self.epoch = epoch
 
+    def _sample_signers(self, rng: random.Random) -> list[str]:
+        """Pick ``signers_per_batch`` signers, optionally balanced across datasets.
+
+        Without ``signer_groups`` signers are sampled uniformly, so a dataset that holds
+        more signers contributes proportionally more of every batch and its script
+        dominates the gradient. With groups, each dataset contributes an equal quota as far
+        as its size allows, and any shortfall is topped up uniformly.
+        """
+        if not self.grouped_signers:
+            return rng.sample(self.eligible_signers, self.signers_per_batch)
+
+        groups = list(self.grouped_signers)
+        rng.shuffle(groups)
+        quota = math.ceil(self.signers_per_batch / len(groups))
+        chosen: list[str] = []
+        for group in groups:
+            candidates = self.grouped_signers[group]
+            take = min(quota, len(candidates), self.signers_per_batch - len(chosen))
+            if take > 0:
+                chosen.extend(rng.sample(candidates, take))
+            if len(chosen) == self.signers_per_batch:
+                break
+        if len(chosen) < self.signers_per_batch:
+            taken = set(chosen)
+            remaining = [signer for signer in self.eligible_signers if signer not in taken]
+            chosen.extend(rng.sample(remaining, self.signers_per_batch - len(chosen)))
+        return chosen
+
     def __iter__(self) -> Iterator[list[int]]:
         # A local seeded RNG makes each epoch reproducible without changing global RNG.
         rng = random.Random(self.seed + self.epoch)
         for _ in range(len(self)):
-            signer_batch = rng.sample(self.eligible_signers, self.signers_per_batch)
+            signer_batch = self._sample_signers(rng)
             indices: list[int] = []
             for signer in signer_batch:
                 groups = self.by_signer[signer]
@@ -308,6 +392,42 @@ class SiameseSignatureModel(nn.Module):
                 parameter.requires_grad = True
 
 
+def _select_negative(
+    anchor_distances: Tensor,
+    mask: Tensor,
+    hardest_positive: Tensor,
+    margin: float,
+    mining: MiningMode,
+    *,
+    allow_empty: bool = False,
+) -> Tensor:
+    """Pick one negative distance per anchor from the candidates in ``mask``.
+
+    ``batch-hard`` takes the closest candidate. ``semi-hard`` prefers the closest
+    candidate that is farther than the hardest positive but still inside the margin, and
+    falls back to the closest candidate when none qualifies. Rows with no candidate yield
+    ``inf`` unless ``allow_empty`` is false, in which case they raise.
+    """
+    empty_rows = mask.sum(dim=1) == 0
+    if not allow_empty and bool(empty_rows.any()):
+        raise ValueError("every anchor must have at least one candidate negative")
+    distances = anchor_distances.masked_fill(~mask, float("inf"))
+    hardest_negative = distances.min(dim=1).values
+    if mining != "semi-hard":
+        return hardest_negative
+    semi_hard_mask = (
+        mask
+        & (anchor_distances > hardest_positive[:, None])
+        & (anchor_distances < (hardest_positive + margin)[:, None])
+    )
+    semi_hard_distances = anchor_distances.masked_fill(~semi_hard_mask, float("inf"))
+    return torch.where(
+        semi_hard_mask.any(dim=1),
+        semi_hard_distances.min(dim=1).values,
+        hardest_negative,
+    )
+
+
 def triplet_loss(
     embeddings: Tensor,
     signer_ids: Tensor,
@@ -315,12 +435,47 @@ def triplet_loss(
     *,
     margin: float = 0.3,
     mining: MiningMode = "batch-hard",
+    negative_pool: NegativePool = "split",
+    forgery_weight: float = 1.0,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Compute triplet loss for genuine anchors and return detached diagnostics.
 
-    Positives are other genuine samples from the same signer. Negatives are
-    genuine samples from different signers or forgeries labeled as imitating
-    the anchor's signer. Forged samples never act as anchors or positives.
+    Positives are other genuine samples from the same signer. Forged samples never act as
+    anchors or positives.
+
+    Negatives come from two pools that teach different things:
+
+    ``identity``
+        genuine samples from *other* signers. This is what makes different writers
+        separable, and it is the pool the random-forgery FAR depends on.
+    ``forgery``
+        forgeries imitating the anchor's own signer. This is what makes skilled forgeries
+        rejectable.
+
+    ``negative_pool="split"`` (default) mines each pool separately and adds the two losses,
+    so more forgeries *add* signal. ``negative_pool="union"`` is the previous behaviour:
+    the pools are merged and a single closest negative is mined. Because a forgery imitates
+    the anchor's signer it is nearly always closer than any other signer's genuine
+    signature, so under ``"union"`` the identity pool is crowded out and stops contributing
+    gradient as soon as forgeries are present -- and the more forgeries per signer, the
+    harder the closest one (an order statistic), so the loss becomes dominated by forgery
+    rejection at the expense of identity separation.
+
+    Args:
+        embeddings: ``(N, D)`` embeddings for the batch.
+        signer_ids: ``(N,)`` signer index per sample.
+        is_forgery: ``(N,)`` bool, ``True`` for skilled forgeries.
+        margin: Triplet margin.
+        mining: ``"batch-hard"`` or ``"semi-hard"``, applied within each pool.
+        negative_pool: ``"split"`` (default) or ``"union"`` (legacy).
+        forgery_weight: Weight of the forgery term. The terms are combined as
+            ``(identity + w * forgery) / (1 + w)`` so the loss magnitude stays comparable
+            to an identity-only loss and the learning rate does not need retuning.
+
+    Returns:
+        The scalar loss and detached diagnostics: ``mean_positive``, ``mean_negative``
+        (the identity, or the union, selected negative), ``mean_identity_negative``,
+        ``mean_forgery_negative``, ``forgery_coverage`` and ``active_fraction``.
     """
     if embeddings.ndim != 2 or signer_ids.ndim != 1 or is_forgery.ndim != 1:
         raise ValueError("expected 2D embeddings and 1D signer/forgery labels")
@@ -328,6 +483,10 @@ def triplet_loss(
         raise ValueError("embeddings and labels must have the same batch size")
     if mining not in {"semi-hard", "batch-hard"}:
         raise ValueError(f"unsupported mining mode: {mining}")
+    if negative_pool not in {"split", "union"}:
+        raise ValueError(f"unsupported negative pool: {negative_pool}")
+    if forgery_weight < 0:
+        raise ValueError("forgery_weight must be non-negative")
 
     # Pairwise distances are used to select examples for each genuine anchor.
     distances = torch.cdist(embeddings.float(), embeddings.float(), p=2)
@@ -336,51 +495,84 @@ def triplet_loss(
     not_self = ~torch.eye(len(signer_ids), dtype=torch.bool, device=signer_ids.device)
     # Positives exclude the anchor itself and must be genuine.
     positives = same_signer & genuine[None, :] & not_self
-    # A same-signer forgery is a valid negative because it imitates the anchor.
-    negatives = ((~same_signer) & genuine[None, :]) | (
-        same_signer & is_forgery.bool()[None, :]
-    )
+    # The two negative pools. Keeping them separate is what stops forgeries from hiding
+    # the cross-signer negatives that teach identity separation.
+    identity_pool = (~same_signer) & genuine[None, :]
+    forgery_pool = same_signer & is_forgery.bool()[None, :]
     anchors = torch.where(genuine)[0]
 
     positive_mask = positives[anchors]
-    negative_mask = negatives[anchors]
+    identity_mask = identity_pool[anchors]
+    forgery_mask = forgery_pool[anchors]
     if torch.any(positive_mask.sum(dim=1) == 0):
         raise ValueError("each genuine anchor needs another genuine sample from its signer")
-    if torch.any(negative_mask.sum(dim=1) == 0):
-        raise ValueError("each genuine anchor needs at least one valid negative")
+    if torch.any(identity_mask.sum(dim=1) == 0):
+        raise ValueError(
+            "each genuine anchor needs a genuine sample from another signer; "
+            "increase --signers-per-batch"
+        )
 
     anchor_distances = distances[anchors]
     # Batch-hard loss takes the farthest valid positive and closest valid negative.
     positive_distances = anchor_distances.masked_fill(~positive_mask, float("-inf"))
     hardest_positive = positive_distances.max(dim=1).values
-    negative_distances = anchor_distances.masked_fill(~negative_mask, float("inf"))
-    hardest_negative = negative_distances.min(dim=1).values
 
-    if mining == "semi-hard":
-        # Choose the nearest negative farther away than the hardest positive but
-        # still within the margin. Fall back to the hardest negative if none qualify.
-        semi_hard_mask = (
-            negative_mask
-            & (anchor_distances > hardest_positive[:, None])
-            & (anchor_distances < (hardest_positive + margin)[:, None])
+    identity_negative = _select_negative(
+        anchor_distances, identity_mask, hardest_positive, margin, mining
+    )
+    identity_per_anchor = F.relu(hardest_positive - identity_negative + margin)
+
+    has_forgery = forgery_mask.any(dim=1)
+    if bool(has_forgery.any()):
+        forgery_negative = _select_negative(
+            anchor_distances, forgery_mask, hardest_positive, margin, mining, allow_empty=True
         )
-        semi_hard_distances = anchor_distances.masked_fill(
-            ~semi_hard_mask, float("inf")
-        )
-        selected_negative = torch.where(
-            semi_hard_mask.any(dim=1),
-            semi_hard_distances.min(dim=1).values,
-            hardest_negative,
-        )
+        forgery_per_anchor = F.relu(hardest_positive - forgery_negative + margin)
+        mean_forgery_negative = forgery_negative[has_forgery].mean().detach()
     else:
-        selected_negative = hardest_negative
+        forgery_negative = torch.full_like(identity_negative, float("inf"))
+        forgery_per_anchor = torch.zeros_like(identity_per_anchor)
+        mean_forgery_negative = torch.zeros((), dtype=identity_per_anchor.dtype)
 
-    per_anchor_loss = F.relu(hardest_positive - selected_negative + margin)
+    if negative_pool == "union":
+        # Legacy behaviour: one merged pool, so the closest of the two kinds wins and the
+        # identity pool stops contributing as soon as a closer forgery exists.
+        union_mask = identity_mask | forgery_mask
+        selected = _select_negative(
+            anchor_distances, union_mask, hardest_positive, margin, mining
+        )
+        per_anchor_loss = F.relu(hardest_positive - selected + margin)
+        return per_anchor_loss.mean(), {
+            "mean_positive": hardest_positive.mean().detach(),
+            "mean_negative": selected.mean().detach(),
+            "mean_identity_negative": identity_negative.mean().detach(),
+            "mean_forgery_negative": mean_forgery_negative,
+            "forgery_coverage": has_forgery.float().mean().detach(),
+            "active_fraction": (per_anchor_loss > 0).float().mean().detach(),
+        }
+
+    identity_loss = identity_per_anchor.mean()
+    forgery_loss = (
+        forgery_per_anchor[has_forgery].mean()
+        if bool(has_forgery.any())
+        else torch.zeros((), dtype=identity_loss.dtype)
+    )
+    # Averaging by (1 + weight) keeps the loss magnitude comparable to an identity-only
+    # loss, so the learning rate and gradient clipping do not need retuning.
+    loss = (identity_loss + forgery_weight * forgery_loss) / (1.0 + forgery_weight)
+
+    active = identity_per_anchor > 0
+    if bool(has_forgery.any()):
+        active = active.clone()
+        active[has_forgery] |= forgery_per_anchor[has_forgery] > 0
     # Metrics are detached so logging them does not retain the autograd graph.
-    return per_anchor_loss.mean(), {
+    return loss, {
         "mean_positive": hardest_positive.mean().detach(),
-        "mean_negative": selected_negative.mean().detach(),
-        "active_fraction": (per_anchor_loss > 0).float().mean().detach(),
+        "mean_negative": identity_negative.mean().detach(),
+        "mean_identity_negative": identity_negative.mean().detach(),
+        "mean_forgery_negative": mean_forgery_negative,
+        "forgery_coverage": has_forgery.float().mean().detach(),
+        "active_fraction": active.float().mean().detach(),
     }
 
 

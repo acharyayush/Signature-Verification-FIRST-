@@ -30,6 +30,14 @@ def main() -> None:
         action="store_true",
         help="Keep grayscale strokes instead of the default black-and-white output.",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Fail if any image cannot be preprocessed. Skipped images silently change the "
+            "per-signer counts, which then changes training batches and evaluation."
+        ),
+    )
     args = parser.parse_args()
 
     root = (args.image_root or args.manifest.parent).resolve()
@@ -72,9 +80,32 @@ def main() -> None:
 
     print(f"wrote {len(out_rows)} images and {out_dir / 'manifest.csv'}")
     if failures:
-        print(f"{len(failures)} skipped:")
-        for message in failures:
+        # A skipped image silently changes the per-signer counts, which then changes the
+        # training batches and the evaluation protocol. Write the list to a file as well as
+        # stdout so it cannot be missed.
+        report = out_dir / "skipped.csv"
+        with report.open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["image_path", "reason"])
+            for message in failures:
+                source, _, reason = message.partition(": ")
+                writer.writerow([source, reason])
+        share = len(failures) / max(1, len(rows))
+        print(
+            f"WARNING: {len(failures)}/{len(rows)} images ({share:.2%}) were skipped; "
+            f"the full list is in {report}"
+        )
+        for message in failures[:20]:
             print(f"  {message}")
+        if len(failures) > 20:
+            print(f"  ... and {len(failures) - 20} more")
+        if args.strict:
+            raise ValueError(
+                f"--strict: {len(failures)} images could not be preprocessed; "
+                f"see {report}"
+            )
+    else:
+        print("every image preprocessed successfully")
 
 
 if __name__ == "__main__":

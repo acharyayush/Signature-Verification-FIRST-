@@ -4,3 +4,6 @@ __pycache__/
 .DS_Store
 data/
 checkpoints/
+# Model weights: a stray best_model.pt (~110 MB) was nearly committed from the repo root.
+*.pt
+*.pth

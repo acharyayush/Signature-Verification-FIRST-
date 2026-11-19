@@ -752,6 +752,42 @@ class EnrollmentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "too few genuine"):
             enroll_and_build_queries(_records(), 7)
 
+    def test_dataset_of_restricts_random_negatives_to_the_same_dataset(self) -> None:
+        # Four signers, two per dataset, one leftover genuine each after five references.
+        records = [
+            SignatureRecord(Path(f"{signer}-{index}.png"), signer, False)
+            for signer in ("a", "b", "c", "d")
+            for index in range(6)
+        ]
+        dataset_of = {"a": "one", "b": "one", "c": "two", "d": "two"}
+
+        def random_count(enrollment) -> int:
+            return sum(1 for query in enrollment.queries if query.kind == "random")
+
+        all_signers = enroll_and_build_queries(records, 5)
+        within = enroll_and_build_queries(records, 5, dataset_of=dataset_of)
+        # Every other signer is an impostor, versus only the same-dataset signer.
+        self.assertEqual(random_count(all_signers), 4 * 3)
+        self.assertEqual(random_count(within), 4 * 1)
+        for query in within.queries:
+            if query.kind == "random":
+                self.assertEqual(
+                    dataset_of[records[query.index].signer_id],
+                    dataset_of[query.target_signer],
+                )
+
+    def test_dataset_of_that_isolates_every_signer_drops_random_queries(self) -> None:
+        records = [
+            SignatureRecord(Path(f"{signer}-{index}.png"), signer, False)
+            for signer in ("a", "b", "c", "d")
+            for index in range(6)
+        ]
+        dataset_of = {signer: signer for signer in ("a", "b", "c", "d")}
+        enrollment = enroll_and_build_queries(records, 5, dataset_of=dataset_of)
+        kinds = [query.kind for query in enrollment.queries]
+        self.assertEqual(kinds.count("random"), 0)
+        self.assertEqual(kinds.count("genuine"), 4)
+
 
 
 class BuildPairMatrixTests(unittest.TestCase):
