@@ -7,11 +7,14 @@ dataset that got worse and a dataset that was always hard produce the same poole
 number. This script runs the *same* protocol on each dataset slice separately, so a
 regression in one dataset cannot hide behind another.
 
-Datasets are identified by the first path component under ``--image-root`` (e.g.
-``BHSig260``, ``cedar``, ``persian``, ``thai``), which is the layout
-:mod:`preprocessing.preprocess_dataset` writes. ``--group-depth 2`` groups by the first
-two components instead, which separates ``BHSig260/BHSig100_Bengali`` from
-``BHSig260/BHSig160_Hindi``.
+Datasets are identified by the leading path components under ``--image-root``. The
+manifest in this repository is laid out as ``{dataset}/{Genuine|Forgery}/{signer}/...``
+(``BHSig260``, ``CEDAR``, ``SigResize``, ``Thai``), and its first path component matches
+the manifest's ``dataset`` column, so ``--group-depth 1`` (the default) is the dataset
+level. ``--group-depth 2`` would split genuine from forgery images *within* a dataset; a
+finer depth is only useful when the layout has an extra sub-dataset component (e.g.
+``BHSig260/BHSig100_Bengali`` vs ``BHSig260/BHSig160_Hindi``) below which both classes
+still appear.
 
 Every block reuses :func:`training.evaluate._metrics`,
 :func:`scoring.fusion.score_queries` and :func:`training.stage3_metric_learning.read_split`,
@@ -22,6 +25,12 @@ Note: inside a dataset slice the "random" negatives are genuine signatures of ot
 signers *of that dataset*, i.e. within-script impostors. That is the harder and more
 meaningful random-forgery number. The pooled run mixes in cross-script pairs, which are
 almost trivially separable and make random FAR look artificially good.
+
+A slice is only scoreable when it holds all three query kinds -- the signer's remaining
+genuine signatures, forgeries of that signer, and genuine signatures of other signers --
+so the grouping must never pull a dataset's genuine and forgery images apart. A slice
+missing a kind is skipped with a printed reason instead of crashing inside the metric
+code, and the run then prints a hint to lower ``--group-depth``.
 
 Usage:
     python -m training.evaluate_per_dataset \\
@@ -60,6 +69,15 @@ from training.stage3_metric_learning import (
 )
 
 
+# Query kinds a slice must produce before it can be turned into a FAR / FRR / EER block.
+_REQUIRED_SCORES = ("deep_genuine", "deep_skilled", "deep_random")
+
+
+def _missing_query_kinds(scores: dict[str, np.ndarray]) -> list[str]:
+    """Return the required query kinds (``genuine``, ``skilled``, ``random``) that are empty."""
+    return [key[len("deep_") :] for key in _REQUIRED_SCORES if scores[key].size == 0]
+
+
 def _slice_scores(
     records,
     embeddings: np.ndarray,
@@ -71,7 +89,18 @@ def _slice_scores(
     max_random_queries: int | None,
     hand_normalizer: HandNormalizer | None,
 ) -> dict[str, np.ndarray]:
-    """Run the shared verification protocol on one slice of the records."""
+    """Run the shared verification protocol on one slice of the records.
+
+    Raises:
+        ValueError: If the slice cannot produce all three query kinds. A per-dataset
+            block needs the signer's remaining genuine signatures, forgeries of that
+            signer, and genuine signatures of other signers; a ``ValueError`` here lets
+            :func:`_collect` skip the slice with a printed reason instead of crashing
+            later inside :func:`training.evaluate._metrics`, which cannot divide by an
+            empty score array. This happens when the grouping is finer than a dataset,
+            e.g. when the manifest stores genuine and forgery images in separate folders
+            (``Genuine`` / ``Forged``) and ``--group-depth`` splits them apart.
+    """
     subset_records = [records[int(index)] for index in indices]
     enrollment = enroll_and_build_queries(
         subset_records, references, max_random_queries=max_random_queries
@@ -80,7 +109,7 @@ def _slice_scores(
         [descriptors[int(index)] for index in indices] if descriptors else []
     )
     subset_keys = [keys[int(index)] for index in indices]
-    return score_queries(
+    scores = score_queries(
         embeddings[indices],
         subset_descriptors,
         enrollment,
@@ -88,6 +117,19 @@ def _slice_scores(
         datasets=subset_keys,
         hand_normalizer=hand_normalizer,
     )
+    missing = _missing_query_kinds(scores)
+    if missing:
+        hints: list[str] = []
+        if "skilled" in missing:
+            hints.append(
+                "the grouping separates genuine from forgery images, so try a lower --group-depth"
+            )
+        if "random" in missing:
+            hints.append("the slice needs at least two signers")
+        raise ValueError(
+            f"no {'/'.join(missing)} queries ({'; '.join(hints)})"
+        )
+    return scores
 
 
 def _collect(
@@ -152,7 +194,10 @@ def main() -> None:
         "--group-depth",
         type=int,
         default=1,
-        help="Path components under --image-root that identify one dataset.",
+        help=(
+            "Path components under --image-root that identify one dataset. Must not "
+            "split a dataset's genuine and forgery images apart, or the slice is skipped."
+        ),
     )
     parser.add_argument("--fusion-config", type=Path)
     parser.add_argument("--max-random-queries", type=int, default=None)
@@ -233,6 +278,22 @@ def main() -> None:
 
     test_pooled, test_per_dataset, test_signers, test_counts = collected["test"]
     val_per_dataset = collected["val"][1]
+
+    # A slice that cannot produce all three query kinds is skipped (see ``_slice_scores``).
+    # Surface one consolidated line, because the per-slice "skipped" lines above can scroll
+    # away and a silently short report is easy to misread as "that dataset is missing".
+    skipped_slices = sorted(set(test_counts) - set(test_per_dataset))
+    if skipped_slices:
+        print(
+            f"skipped {len(skipped_slices)}/{len(test_counts)} test slices "
+            f"(no per-dataset block): {skipped_slices}"
+        )
+        if args.group_depth > 1:
+            print(
+                "  hint: if the manifest stores genuine and forgery images in separate "
+                f"folders, --group-depth {args.group_depth} splits them apart; re-run with "
+                f"--group-depth {args.group_depth - 1} to keep each dataset whole."
+            )
     report: dict[str, object] = {
         "threshold_from_validation": threshold,
         "threshold_source": threshold_source,
