@@ -15,12 +15,12 @@ decision system.
 | 3. Deep metric learning | Train a ConvNeXt-Tiny encoder to map signatures into an embedding space. | Implemented in [`training/stage3_metric_learning.py`](./training/stage3_metric_learning.py) and [`training/train_siamese.py`](./training/train_siamese.py) |
 | 4. Scoring and verification | Compare embeddings with cosine similarity and evaluate a policy on representative data. | Similarity helper implemented; thresholds and deployment evaluation require project data |
 
-The Stage 2 output expected by Stage 3 is a 384 px wide, 192 px high grayscale
-image (`H x W = 192 x 384`, `target_size = (width, height) = (384, 192)`) with
+The Stage 2 output expected by Stage 3 is a 512 px wide, 256 px high grayscale
+image (`H x W = 256 x 512`, `target_size = (width, height) = (512, 256)`) with
 dark ink on a white background. Grayscale intensity is retained to represent
 stroke pressure and ink flow. The preprocessing module converts this to an
-ImageNet-normalized PyTorch tensor in `C x H x W` order: 3 channels, 192 high,
-384 wide. Keep the same preprocessing options for training and inference.
+ImageNet-normalized PyTorch tensor in `C x H x W` order: 3 channels, 256 high,
+512 wide. Keep the same preprocessing options for training and inference.
 
 ## Environment setup
 
@@ -119,7 +119,7 @@ dataset applies the project's Stage 2.2 preprocessing path. The path preserves
 grayscale intensity rather than reducing pixels to two levels and whitens the
 estimated paper background to 255. It assumes dark signatures on a white or
 whitish background; the legacy `--ink` option remains accepted for compatibility
-but is ignored. If files are already preprocessed 192 x 384 grayscale images, pass
+but is ignored. If files are already preprocessed 256 x 512 grayscale images, pass
 `--already-preprocessed`.
 
 ### Public-dataset preprocessing (black and white)
@@ -127,7 +127,7 @@ but is ignored. If files are already preprocessed 192 x 384 grayscale images, pa
 Public datasets are prepared once with `python -m preprocessing.build_manifests`
 (per-dataset signer splits in `data/manifests/`, merged into `data/manifest.csv`) and
 `python -m preprocessing.preprocess_dataset` (writes `data/processed/`). This step
-writes pure black-and-white (0/255) 192 x 384 PNGs by default, because BHSig260 is
+writes pure black-and-white (0/255) 256 x 512 PNGs by default, because BHSig260 is
 already binary; pass `--grayscale` to keep grayscale strokes. Training and inference
 must use matching preprocessing.
 
@@ -152,7 +152,7 @@ Useful options:
 --image-root PATH                 Base directory for relative image paths
 --device auto|cpu|cuda|mps        Compute device (auto: CUDA, otherwise CPU)
 --ink auto|light|dark             Legacy compatibility option; ignored
---already-preprocessed            Require 192x384 grayscale input files
+--already-preprocessed            Require 256x512 grayscale input files
 --no-pretrained                   Initialize ConvNeXt without pretrained weights
 --phase1-epochs N                 Warm-up epochs (default 5)
 --phase2-epochs N                 Fine-tuning epochs (default 20)

@@ -80,14 +80,14 @@ Four claims in `docs/score_fusion.md` did not match the code and were corrected:
 | --- | --- | --- |
 | 1. Signature extraction | Detect/crop the signature from the cheque (YOLO etc.) | Upstream, **not in this repo** |
 | 2.1 Artifact cleaning | Remove stamps, printed lines, noise | Upstream, **not in this repo** |
-| 2.2 Image preprocessing | Grayscale normalize, tight ink crop, aspect-aware resize to `384 × 192` | `preprocessing/signature_preprocessing.py` |
+| 2.2 Image preprocessing | Grayscale normalize, tight ink crop, aspect-aware resize to `512 × 256` | `preprocessing/signature_preprocessing.py` |
 | 3. Deep metric learning | ConvNeXt-Tiny Siamese encoder → L2-normalized 512-D embedding | `training/stage3_metric_learning.py`, `training/train_siamese.py` |
 | 4. Scoring | Cosine similarity over references; optional 9-feature fusion; FAR/FRR/EER | `training/evaluate.py`, `scoring/` |
 
 ### Stage 4 in detail
 
 ```
-preprocessed 192x384 grayscale  ──┬─► ConvNeXt-Tiny encoder ──► 512-D embedding ──► cosine sim ──┐
+preprocessed 256x512 grayscale  ──┬─► ConvNeXt-Tiny encoder ──► 512-D embedding ──► cosine sim ──┐
                                   │                                                             ├─► fusion ──► score ──► threshold ──► accept/reject
                                   └─► describe_image() ──► 9 features ──► pair features ────────┘
 ```
@@ -273,7 +273,7 @@ Stage 2.2 is CPU work and only ever needs to happen once. Run it here, not on Ka
 mkdir -p data/manifests
 python -m preprocessing.build_manifests
 
-# Local — raw .tif -> 192x384 PNGs + data/processed/manifest.csv (~10-20 min for 16.6k)
+# Local — raw .tif -> 256x512 PNGs + data/processed/manifest.csv (~10-20 min for 16.6k)
 python -m preprocessing.preprocess_dataset \
   --manifest data/manifest.csv \
   --output-dir data/processed

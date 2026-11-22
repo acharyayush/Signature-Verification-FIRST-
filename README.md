@@ -31,7 +31,7 @@ cheque signature and one or more stored reference signatures.
 | --- | --- | --- |
 | 1. Signature extraction | Detect and crop the signature from the cheque (e.g. YOLO). | Upstream, outside this repo |
 | 2.1 Artifact cleaning | Remove stamps, printed lines, and noise from the crop. | Upstream, outside this repo |
-| 2.2 Image preprocessing | Grayscale normalization, tight ink crop, aspect-aware resize to `384 × 192`. | Implemented in [`preprocessing/`](./preprocessing) |
+| 2.2 Image preprocessing | Grayscale normalization, tight ink crop, aspect-aware resize to `512 × 256`. | Implemented in [`preprocessing/`](./preprocessing) |
 | 3. Deep metric learning | Train a ConvNeXt-Tiny Siamese encoder that outputs L2-normalized 512-D embeddings. | Implemented in [`training/`](./training) |
 | 4. Scoring & verification | Compare embeddings with cosine similarity; optionally fuse handcrafted geometric features; evaluate FAR / FRR / EER. | Implemented in [`training/evaluate.py`](./training/evaluate.py) and [`scoring/`](./scoring) |
 
@@ -53,7 +53,7 @@ Signature-Verification/
 ├── preprocessing/
 │   ├── signature_preprocessing.py   Stage 2.2: grayscale normalize + aspect-aware resize
 │   ├── build_manifests.py           Build the BHSig260 manifest and merge per-dataset manifests
-│   ├── preprocess_dataset.py        One-time: raw dataset -> 192x384 PNGs + processed manifest
+│   ├── preprocess_dataset.py        One-time: raw dataset -> 256x512 PNGs + processed manifest
 │   └── demo_outputs.py              Demo: preprocess the sample JPEGs
 ├── training/
 │   ├── stage3_metric_learning.py    Model, dataset, PK batch sampler, triplet loss
@@ -73,9 +73,9 @@ Signature-Verification/
 1. **Preprocess (stage 2.2).** `preprocess_signature` converts a crop to grayscale
    (dark ink on white, keeping grayscale stroke intensity), flattens uneven
    illumination, crops tightly to the ink with a small margin, and resizes without
-   stretching onto a `384 × 192` white canvas. `to_model_input` then replicates the
+   stretching onto a `512 × 256` white canvas. `to_model_input` then replicates the
    single channel to 3 channels and applies ImageNet normalization, producing the
-   `3 × 192 × 384` tensor the model expects. Empty crops raise `ValueError` so they can
+   `3 × 256 × 512` tensor the model expects. Empty crops raise `ValueError` so they can
    be routed to human review.
 2. **Train (stage 3).** `python -m training.train_siamese` reads a signer-disjoint CSV
    manifest and trains the encoder in two phases: first the ConvNeXt backbone is frozen
@@ -175,7 +175,7 @@ requested number of genuine images for each batch.
 By default, images are read as Stage 2.1 outputs and passed through
 `preprocess_signature` using the same Stage 2.2 path as inference. Stage 2.2
 preserves grayscale stroke intensity so pressure and ink flow are not lost and
-whitens the estimated paper background to 255. For already preprocessed 192x384
+whitens the estimated paper background to 255. For already preprocessed 256x512
 grayscale images, pass `--already-preprocessed`. The preprocessing assumes dark
 signatures on a white or whitish background. The legacy `--ink` option remains
 accepted for compatibility but is ignored.
@@ -206,7 +206,7 @@ python -m unittest discover -s tests -t .
 
 The deep cosine score alone is already a strong baseline. On skilled forgeries it can
 still be improved by fusing in cheap, interpretable handcrafted evidence computed from
-the same preprocessed `192 × 384` grayscale image. The fusion module lives in
+the same preprocessed `512 × 256` grayscale image. The fusion module lives in
 [`scoring/`](./scoring) and is entirely optional: without `--fusion-config` the deep
 baseline numbers are unchanged.
 

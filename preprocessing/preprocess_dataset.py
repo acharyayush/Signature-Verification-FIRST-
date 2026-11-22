@@ -1,4 +1,4 @@
-"""One-time preprocessing: raw manifest -> 192x384 black-and-white PNGs + processed manifest
+"""One-time preprocessing: raw manifest -> 256x512 black-and-white PNGs + processed manifest
 (pass --grayscale to keep grayscale strokes).
 
 Usage:

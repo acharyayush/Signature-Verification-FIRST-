@@ -320,7 +320,7 @@ class SiameseModelTests(unittest.TestCase):
 
     def test_embeddings_are_unit_norm_and_batch_size_one_works(self) -> None:
         self.model.train()
-        embedding = self.model(torch.randn(1, 3, 192, 384))
+        embedding = self.model(torch.randn(1, 3, 256, 512))
         self.assertEqual(tuple(embedding.shape), (1, 512))
         self.assertAlmostEqual(embedding.norm(dim=1).item(), 1.0, places=5)
 
@@ -351,7 +351,7 @@ class SiameseModelTests(unittest.TestCase):
 
     def test_compare_returns_cosine_similarity(self) -> None:
         self.model.eval()
-        image = torch.randn(2, 3, 192, 384)
+        image = torch.randn(2, 3, 256, 512)
         similarity = self.model.compare(image, image)
         self.assertTrue(torch.allclose(similarity, torch.ones(2), atol=1e-5))
 

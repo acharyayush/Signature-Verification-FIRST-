@@ -22,7 +22,7 @@ modality's representation intact and lets the fusion be fitted and audited separ
 
 Every feature is computed from the same `uint8` grayscale image the CNN consumes:
 the Stage 2.2 output of `preprocessing.signature_preprocessing.preprocess_signature`
-(or an already preprocessed `192 x 384` grayscale file). Reading through the shared
+(or an already preprocessed `256 x 512` grayscale file). Reading through the shared
 loader is what prevents train/serve skew between the CNN and the handcrafted branch.
 
 All nine values are bounded to `[0, 1]`. Eight are similarities where larger means

@@ -64,7 +64,7 @@ This system only relies on the following contract for the upstream output:
 #### Step 2.2: Grayscale normalization and aspect-aware resize (implemented)
 
 **Input:** the signature image from step 2.1 (any size, grayscale or BGR, dark ink on a white or whitish background).
-**Output:** a `192 × 384` (H × W) `uint8` grayscale image with dark ink on a
+**Output:** a `256 × 512` (H × W) `uint8` grayscale image with dark ink on a
 white background, ready for Stage 3. Grayscale values are retained so the model
 can use pressure and ink-flow information.
 
@@ -72,8 +72,8 @@ Signatures are wide, so a square canvas wastes most of the input area and forces
 
 | Setting | Previous | Agreed |
 | --- | --- | --- |
-| Canvas (W × H) | `224 × 224` | **`384 × 192`** (2:1) |
-| Pixels | 50,176 | 73,728 (about 1.5×) |
+| Canvas (W × H) | `384 × 192` | **`512 × 256`** (2:1) |
+| Pixels | 73,728 | 131,072 (about 1.8×) |
 | Divisible by 32 | Yes | Yes (ConvNeXt total stride) |
 
 Procedure (`preprocess_signature`):
@@ -86,14 +86,14 @@ Procedure (`preprocess_signature`):
 3. **Aspect-aware resize** (`aspect_aware_resize`):
    - Compute `scale = min(W_target / w, H_target / h)`. The image is scaled uniformly, so no stretching occurs.
    - Resize with `INTER_AREA` when shrinking (avoids aliasing of thin strokes) and `INTER_CUBIC` when enlarging.
-   - Center the result on a `384 × 192` white canvas (`pad_value = 255`, matching the background).
+   - Center the result on a `512 × 256` white canvas (`pad_value = 255`, matching the background).
 4. **Model tensor** (`to_model_input`, called by Stage 3): replicate the single channel to 3 channels and normalize with ImageNet mean and standard deviation, to use the pretrained weights unchanged.
 
 ```python
 from preprocessing.signature_preprocessing import preprocess_signature, to_model_input
 
-image = preprocess_signature(stage2_1_output, target_size=(384, 192))  # 192 x 384 uint8 grayscale
-tensor = to_model_input(image)                                                     # 3 x 192 x 384 float32
+image = preprocess_signature(stage2_1_output, target_size=(512, 256))  # 256 x 512 uint8 grayscale
+tensor = to_model_input(image)                                                     # 3 x 256 x 512 float32
 ```
 
 Notes:
@@ -102,7 +102,7 @@ Notes:
 - Illumination flattening uses a morphological background estimate. If real scans show difficult uneven illumination, an adaptive grayscale correction is an alternative to evaluate.
 - Tight cropping discards the absolute position and size of the signature within the box. Relative proportions (aspect ratio) are kept by the uniform scaling. If absolute size is found to be informative, compare against a variant that skips the ink crop in the ablation study (Section 5.4).
 - `convnext_tiny` is fully convolutional with global average pooling, so non-square inputs need no architectural change.
-- The canvas size is a hyperparameter. Compare `224 × 224`, `384 × 192`, and a larger option such as `512 × 256` in the ablation study (Section 5), because the best size depends on the scan DPI and the stroke thickness after cropping.
+- The canvas size is a hyperparameter. Compare `384 × 192`, `512 × 256` (current), and a larger option such as `640 × 320` in the ablation study (Section 5), because the best size depends on the scan DPI and the stroke thickness after cropping.
 - Use the identical step at training and inference time. Any difference in threshold method, padding value, or interpolation is a train/serve skew. Apply augmentation before this step (Section 4).
 
 ### Stage 3: Deep metric learning (Siamese network)
@@ -253,7 +253,7 @@ Run each change against the baseline on the validation set, and confirm the fina
 
 | Question | Variants |
 | --- | --- |
-| Input resolution and shape | `224 × 224` (padded square) vs. `384 × 192` (current) vs. `512 × 256` |
+| Input resolution and shape | `224 × 224` (padded square) vs. `384 × 192` vs. `512 × 256` (current) vs. `640 × 320` |
 | Tight ink crop | With (current) vs. without (whole Stage 2 canvas resized) |
 | Loss | Contrastive vs. triplet (random) vs. triplet (semi-hard) vs. triplet (batch-hard) |
 | Skilled forgeries as negatives | With vs. without forgeries in training |

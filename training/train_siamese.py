@@ -165,7 +165,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--already-preprocessed",
         action="store_true",
-        help="Input files are already 192x384 Stage 2 output images",
+        help="Input files are already 256x512 Stage 2 output images",
     )
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--phase1-epochs", type=int, default=5)

@@ -52,7 +52,7 @@ def _descriptor(index: int) -> SignatureDescriptors:
     profile[index % 7] += 0.01
     profile /= profile.sum()
     return SignatureDescriptors(
-        bbox=(0, 0, 384, 192),
+        bbox=(0, 0, 512, 256),
         aspect=4.0 + 0.05 * index,
         stroke_width=3.0 + 0.02 * index,
         density=0.2 + 0.001 * index,
