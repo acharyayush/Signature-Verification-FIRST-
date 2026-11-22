@@ -319,10 +319,16 @@ changed", and pooled random negatives are dominated by trivial cross-script pair
 **What.** A new entry point that runs the *same* protocol on each dataset slice, reusing
 `training.evaluate._metrics`, `scoring.fusion.score_queries` and
 `stage3_metric_learning.read_split`, so the per-dataset numbers cannot drift from the pooled
-ones. `--group-depth 1` groups by `BHSig260` / `cedar` / `persian` / `thai`; `--group-depth 2`
-splits `BHSig260/BHSig100_Bengali` from `BHSig260/BHSig160_Hindi`. Inside a slice, "random"
-negatives are within-dataset impostors — the harder and more meaningful number. Each slice
-reports its own `eer_skilled` (threshold-free) plus FAR/FRR at the shared threshold.
+ones. `--group-depth` is the number of leading path components under `--image-root` that
+name one dataset. The processed layout is `{dataset}/{Genuine|Forgery}/{signer}/x.png`, so
+`--group-depth 1` yields `BHSig260` / `CEDAR` / `SigResize` / `Thai`, while `--group-depth 2`
+would yield `BHSig260/Genuine` and `BHSig260/Forgery`. The depth must land on a folder that
+still holds both genuine and forgery images and at least two signers, or the slice cannot be
+scored and is skipped — so **`--group-depth 1` is correct for this manifest**. Raise the
+depth only when the manifest nests a real sub-dataset (for example `BHSig260/BHSig100_Bengali`)
+*above* the genuine/forgery folders. Inside a slice, "random" negatives are within-dataset
+impostors — the harder and more meaningful number. Each slice reports its own `eer_skilled`
+(threshold-free) plus FAR/FRR at the shared threshold.
 
 ### S5 — One shared dataset-label mapping (`dataset_labels`)
 
@@ -653,13 +659,17 @@ python -m training.evaluate \
 python -m training.evaluate_per_dataset \
   --checkpoint checkpoints/stage3/best_model.pt \
   --manifest /kaggle/input/.../manifest.csv --already-preprocessed \
-  --references 2 --target-far 0.03 --group-depth 2 \
+  --references 2 --target-far 0.03 --group-depth 1 \
   --fusion-config checkpoints/fusion/fusion.json \
   --report checkpoints/fusion/per_dataset.json
 ```
 
-`--group-depth 2` splits `BHSig260/BHSig100_Bengali` from `BHSig260/BHSig160_Hindi`, which
-is the finest split available for this manifest.
+`--group-depth 1` is the dataset level for this manifest: the processed paths are
+`{dataset}/{Genuine|Forgery}/{signer}/x.png`, so depth 1 yields `BHSig260`, `CEDAR`,
+`SigResize` and `Thai`. Depth 2 would land on the `Genuine`/`Forgery` folders, which splits
+each dataset's genuine and forgery images apart, so every slice is skipped and no
+per-dataset block is produced. Only raise the depth when the manifest nests a real
+sub-dataset (for example `BHSig260/BHSig100_Bengali`) *above* the genuine/forgery folders.
 
 ### 7.6 Notes
 

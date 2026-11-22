@@ -1,0 +1,134 @@
+{
+  "threshold_from_validation": 0.9209622312462794,
+  "threshold_source": "validation_target_far",
+  "validation_eer_skilled": 0.1512815300079099,
+  "references": 2,
+  "group_depth": 1,
+  "datasets": {
+    "BHSig260": {
+      "signers_in_test": 39,
+      "records_in_test": 2106,
+      "test": {
+        "far_skilled_at_threshold": 0.009401709401709401,
+        "far_random_at_threshold": 0.006993006993006993,
+        "frr_at_threshold": 0.4382284382284382,
+        "eer_skilled": 0.08830613830613832,
+        "eer_random": 0.07109557109557109,
+        "genuine_queries": 858,
+        "skilled_forgeries": 1170,
+        "random_pairs": 32604
+      },
+      "validation_eer_skilled": 0.07692307692307693,
+      "test_fused": {
+        "far_skilled_at_threshold": 0.007692307692307693,
+        "far_random_at_threshold": 0.0023616734143049934,
+        "frr_at_threshold": 0.4696969696969697,
+        "eer_skilled": 0.07101787101787102,
+        "eer_random": 0.053613053613053616,
+        "genuine_queries": 858,
+        "skilled_forgeries": 1170,
+        "random_pairs": 32604
+      }
+    },
+    "CEDAR": {
+      "signers_in_test": 8,
+      "records_in_test": 384,
+      "test": {
+        "far_skilled_at_threshold": 0.036458333333333336,
+        "far_random_at_threshold": 0.0,
+        "frr_at_threshold": 0.7272727272727273,
+        "eer_skilled": 0.20928030303030304,
+        "eer_random": 0.07386363636363637,
+        "genuine_queries": 176,
+        "skilled_forgeries": 192,
+        "random_pairs": 1232
+      },
+      "validation_eer_skilled": 0.1766098484848485,
+      "test_fused": {
+        "far_skilled_at_threshold": 0.03125,
+        "far_random_at_threshold": 0.0,
+        "frr_at_threshold": 0.6875,
+        "eer_skilled": 0.19294507575757575,
+        "eer_random": 0.06818181818181818,
+        "genuine_queries": 176,
+        "skilled_forgeries": 192,
+        "random_pairs": 1232
+      }
+    },
+    "SigResize": {
+      "signers_in_test": 17,
+      "records_in_test": 1172,
+      "test": {
+        "far_skilled_at_threshold": 0.03506311360448808,
+        "far_random_at_threshold": 0.0,
+        "frr_at_threshold": 0.7505882352941177,
+        "eer_skilled": 0.2802524544179523,
+        "eer_random": 0.1061029411764706,
+        "genuine_queries": 425,
+        "skilled_forgeries": 713,
+        "random_pairs": 6800
+      },
+      "validation_eer_skilled": 0.2538095238095238,
+      "test_fused": {
+        "far_skilled_at_threshold": 0.04067321178120617,
+        "far_random_at_threshold": 0.00014705882352941175,
+        "frr_at_threshold": 0.691764705882353,
+        "eer_skilled": 0.25914528504248824,
+        "eer_random": 0.09691176470588235,
+        "genuine_queries": 425,
+        "skilled_forgeries": 713,
+        "random_pairs": 6800
+      }
+    },
+    "Thai": {
+      "signers_in_test": 10,
+      "records_in_test": 308,
+      "test": {
+        "far_skilled_at_threshold": 0.014285714285714285,
+        "far_random_at_threshold": 0.0,
+        "frr_at_threshold": 0.581081081081081,
+        "eer_skilled": 0.17712355212355213,
+        "eer_random": 0.06719219219219219,
+        "genuine_queries": 148,
+        "skilled_forgeries": 140,
+        "random_pairs": 1332
+      },
+      "validation_eer_skilled": 0.2725,
+      "test_fused": {
+        "far_skilled_at_threshold": 0.0,
+        "far_random_at_threshold": 0.0,
+        "frr_at_threshold": 0.43243243243243246,
+        "eer_skilled": 0.17017374517374517,
+        "eer_random": 0.047672672672672674,
+        "genuine_queries": 148,
+        "skilled_forgeries": 140,
+        "random_pairs": 1332
+      }
+    }
+  },
+  "target_far": 0.03,
+  "validation_far_skilled_at_threshold": 0.02959927140255009,
+  "pooled_test": {
+    "far_skilled_at_threshold": 0.020316027088036117,
+    "far_random_at_threshold": 0.001952076105395061,
+    "frr_at_threshold": 0.5656502800248911,
+    "eer_skilled": 0.15857289145541303,
+    "eer_random": 0.0698144249047404,
+    "genuine_queries": 1607,
+    "skilled_forgeries": 2215,
+    "random_pairs": 117311
+  },
+  "fused_threshold_used": 0.868862256410101,
+  "fused_threshold_source": "fusion_config_out_of_fold",
+  "fused_validation_far_skilled_at_threshold": 0.02959927140255009,
+  "pooled_test_fused": {
+    "far_skilled_at_threshold": 0.019864559819413093,
+    "far_random_at_threshold": 0.0006648992848070514,
+    "frr_at_threshold": 0.5488487865588052,
+    "eer_skilled": 0.14625530797119263,
+    "eer_random": 0.05834065006691615,
+    "genuine_queries": 1607,
+    "skilled_forgeries": 2215,
+    "random_pairs": 117311
+  }
+}

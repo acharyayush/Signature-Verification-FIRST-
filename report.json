@@ -1,0 +1,50 @@
+{
+  "threshold_from_validation": 0.9209622207786833,
+  "threshold_source": "validation_target_far",
+  "validation_eer_skilled": 0.1512815300079099,
+  "random_negative_scope": "within-dataset",
+  "test": {
+    "far_skilled_at_threshold": 0.020316027088036117,
+    "far_random_at_threshold": 0.005432710636675562,
+    "frr_at_threshold": 0.5656502800248911,
+    "eer_skilled": 0.15857289145541303,
+    "eer_random": 0.11061525882404018,
+    "genuine_queries": 1607,
+    "skilled_forgeries": 2215,
+    "random_pairs": 41968
+  },
+  "target_far": 0.03,
+  "validation_far_skilled_at_threshold": 0.02959927140255009,
+  "fusion": {
+    "config": "/kaggle/working/repo/checkpoints/fusion/fusion.json",
+    "type": "weighted",
+    "features": [
+      "sim_ink_aspect_similarity",
+      "sim_stroke_width_similarity",
+      "x_endpoints_ratio",
+      "x_junctions_ratio",
+      "x_slant_diff",
+      "sim_density_similarity",
+      "h_proj",
+      "v_proj",
+      "sim_hu_similarity"
+    ],
+    "dropped_features": [],
+    "threshold_from_validation": 0.8712530921790038,
+    "threshold_used": 0.868862256410101,
+    "threshold_source": "fusion_config_out_of_fold",
+    "validation_eer_skilled": 0.14114092799199898,
+    "test": {
+      "far_skilled_at_threshold": 0.021218961625282168,
+      "far_random_at_threshold": 0.003240564239420511,
+      "frr_at_threshold": 0.4710640945861854,
+      "eer_skilled": 0.14571843556899064,
+      "eer_random": 0.09278790744884952,
+      "genuine_queries": 1607,
+      "skilled_forgeries": 2215,
+      "random_pairs": 41968
+    },
+    "target_far": 0.03,
+    "validation_far_skilled_at_threshold": 0.02959927140255009
+  }
+}

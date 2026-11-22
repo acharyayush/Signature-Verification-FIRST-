@@ -52,6 +52,7 @@ import torch
 
 from scoring.fusion import (
     HAND_NORMALIZATION_KEY,
+    FusionConfig,
     FusionScorer,
     HandNormalizer,
     enroll_and_build_queries,
@@ -76,6 +77,33 @@ _REQUIRED_SCORES = ("deep_genuine", "deep_skilled", "deep_random")
 def _missing_query_kinds(scores: dict[str, np.ndarray]) -> list[str]:
     """Return the required query kinds (``genuine``, ``skilled``, ``random``) that are empty."""
     return [key[len("deep_") :] for key in _REQUIRED_SCORES if scores[key].size == 0]
+
+
+def _fused_threshold(
+    config: FusionConfig | None,
+    val_scores: dict[str, np.ndarray],
+    target_far: float | None,
+) -> tuple[float, str, float | None]:
+    """Return the fused operating point as ``(threshold, source, achieved_far)``.
+
+    The fused scores live on a different scale from the deep cosine scores, so they must
+    not be thresholded with the deep threshold. This mirrors :mod:`training.evaluate`:
+    derive a threshold from the pooled validation split, then prefer the one the fitter
+    calibrated out-of-fold when the config carries it.
+    """
+    if target_far is not None:
+        threshold, achieved_far = threshold_at_far(val_scores["fused_skilled"], target_far)
+        source = "validation_target_far"
+    else:
+        threshold = float(
+            eer_threshold(val_scores["fused_genuine"], val_scores["fused_skilled"])[0]
+        )
+        achieved_far = None
+        source = "validation_eer"
+    if config is not None and config.threshold is not None:
+        threshold = float(config.threshold)
+        source = "fusion_config_out_of_fold"
+    return threshold, source, achieved_far
 
 
 def _slice_scores(
@@ -226,6 +254,7 @@ def main() -> None:
 
     scorer: FusionScorer | None = None
     hand_normalizer: HandNormalizer | None = None
+    config: FusionConfig | None = None
     if args.fusion_config is not None:
         config = load_fusion_config(args.fusion_config)
         scorer = FusionScorer(config)
@@ -276,6 +305,15 @@ def main() -> None:
         validation_far = None
         threshold_source = "validation_eer"
 
+    # The fused scores are on a different scale, so they get their own operating point.
+    fused_threshold: float | None = None
+    fused_threshold_source: str | None = None
+    fused_validation_far: float | None = None
+    if scorer is not None:
+        fused_threshold, fused_threshold_source, fused_validation_far = _fused_threshold(
+            config, val_pooled, args.target_far
+        )
+
     test_pooled, test_per_dataset, test_signers, test_counts = collected["test"]
     val_per_dataset = collected["val"][1]
 
@@ -317,12 +355,17 @@ def main() -> None:
                 val_per_dataset[key]["deep_genuine"], val_per_dataset[key]["deep_skilled"]
             )
         if scorer is not None:
-            entry["test_fused"] = _metrics(test_per_dataset[key], "fused", threshold)
+            entry["test_fused"] = _metrics(test_per_dataset[key], "fused", fused_threshold)
         datasets[key] = entry
     report["datasets"] = datasets
     report["pooled_test"] = _metrics(test_pooled, "deep", threshold)
+    if fused_threshold is not None:
+        report["fused_threshold_used"] = fused_threshold
+        report["fused_threshold_source"] = fused_threshold_source
+        if fused_validation_far is not None:
+            report["fused_validation_far_skilled_at_threshold"] = fused_validation_far
     if scorer is not None:
-        report["pooled_test_fused"] = _metrics(test_pooled, "fused", threshold)
+        report["pooled_test_fused"] = _metrics(test_pooled, "fused", fused_threshold)
 
     text = json.dumps(report, indent=2)
     print(text)

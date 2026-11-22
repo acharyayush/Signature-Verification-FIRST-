@@ -21,7 +21,12 @@ from pathlib import Path
 
 import numpy as np
 
-from training.evaluate_per_dataset import _missing_query_kinds, _slice_scores
+from training.evaluate_per_dataset import (
+    _fused_threshold,
+    _missing_query_kinds,
+    _slice_scores,
+)
+from scoring.fusion import FusionConfig
 from training.stage3_metric_learning import SignatureRecord
 
 
@@ -96,6 +101,47 @@ class SliceScoresTests(unittest.TestCase):
         self.assertEqual(scores["deep_genuine"].size, 4)  # 2 signers * (4 - 2 refs)
         self.assertEqual(scores["deep_skilled"].size, 4)  # 2 signers * 2 forgeries
         self.assertEqual(scores["deep_random"].size, 4)  # each signer vs the other's 2
+
+
+class FusedThresholdTests(unittest.TestCase):
+    """The fused scores are on a different scale than the deep cosine scores.
+
+    Applying the deep threshold to the fused scores (the previous behaviour) rejected
+    almost every genuine signature, so these tests pin down that the fused family gets
+    its own operating point.
+    """
+
+    def _scores(self) -> dict[str, np.ndarray]:
+        rng = np.random.default_rng(0)
+        return {
+            "fused_genuine": rng.normal(0.90, 0.05, size=200),
+            "fused_skilled": rng.normal(0.70, 0.05, size=200),
+        }
+
+    def test_config_threshold_wins_over_the_validation_split(self) -> None:
+        config = FusionConfig(type="weighted", threshold=0.55)
+        threshold, source, _ = _fused_threshold(config, self._scores(), target_far=0.03)
+        self.assertEqual(source, "fusion_config_out_of_fold")
+        self.assertAlmostEqual(threshold, 0.55)
+
+    def test_falls_back_to_target_far_without_a_config_threshold(self) -> None:
+        config = FusionConfig(type="weighted")  # threshold is None
+        scores = self._scores()
+        threshold, source, achieved = _fused_threshold(config, scores, target_far=0.03)
+        self.assertEqual(source, "validation_target_far")
+        self.assertLessEqual(achieved, 0.03)
+        # The operating point sits between the two fused distributions, not at the deep scale.
+        self.assertGreater(threshold, float(scores["fused_skilled"].mean()))
+        self.assertLess(threshold, float(scores["fused_genuine"].mean()))
+
+    def test_using_the_deep_threshold_would_reject_far_more_genuine(self) -> None:
+        config = FusionConfig(type="weighted")
+        scores = self._scores()
+        fused_threshold, _, _ = _fused_threshold(config, scores, target_far=0.03)
+        deep_scale_threshold = 0.92  # what the deep block uses
+        frr_at_deep_scale = float((scores["fused_genuine"] < deep_scale_threshold).mean())
+        frr_at_fused_scale = float((scores["fused_genuine"] < fused_threshold).mean())
+        self.assertGreater(frr_at_deep_scale, frr_at_fused_scale)
 
 
 if __name__ == "__main__":

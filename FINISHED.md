@@ -589,6 +589,28 @@ Once the checkpoint exists, run Cells 6–7 and put the four numbers in the READ
 `eer_skilled` and `eer_random` for the deep baseline and for the fused scorer. The fusion
 path only earns its place if `eer_skilled` drops without `eer_random` collapsing.
 
+Report the per-dataset breakdown as well, so a regression in one script cannot hide inside
+the pooled number:
+
+```bash
+python -m training.evaluate_per_dataset \
+  --checkpoint checkpoints/stage3/best_model.pt \
+  --manifest data/processed/manifest.csv --already-preprocessed \
+  --references 2 --group-depth 1 \
+  --fusion-config checkpoints/fusion/fusion.json \
+  --report checkpoints/fusion/per_dataset.json
+```
+
+`--group-depth` is the number of leading path components under `--image-root` that name one
+dataset. The processed layout is `{dataset}/{Genuine|Forgery}/{signer}/x.png`, so
+`--group-depth 1` groups by `BHSig260` / `CEDAR` / `SigResize` / `Thai`. Depth 2 would group
+by `BHSig260/Genuine` and `BHSig260/Forgery`, which separates a dataset's genuine and forgery
+images, so every slice is skipped and no per-dataset block is produced. Only raise the depth
+when the manifest nests a real sub-dataset (for example `BHSig260/BHSig100_Bengali`) *above*
+the genuine/forgery folders. A slice is scoreable only when it holds genuine signatures,
+forgeries and at least two signers; the script prints a hint to lower the depth when it skips
+one. Use `--group-depth 1`.
+
 ### 8.3 Calibrate the operating threshold
 
 The fused threshold is currently the EER point from signer-grouped CV. For a cheque
