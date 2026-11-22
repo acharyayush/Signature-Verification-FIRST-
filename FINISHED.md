@@ -291,11 +291,12 @@ print('signers', len({r['signer_id'] for r in rows}))
 
 Two things to know about the manifest step:
 
-* `preprocessing/build_manifests.py` builds only the **BHSig260** rows, then merges every
-  `*.csv` in `data/manifests/` into `data/manifest.csv`. There is no CEDAR builder in this
-  repo, so if your manifest holds CEDAR rows (the current one does —
-  `raw/cedar/full_org/*.png`), make sure that CEDAR CSV is back in `data/manifests/` before
-  rebuilding, or the merge silently drops CEDAR.
+* `preprocessing/build_manifests.py` writes one signer-disjoint manifest per raw dataset —
+  BHSig260, CEDAR, SigResize and Thai — under `data/manifests/`, then merges every `*.csv`
+  there into `data/manifest.csv`. Each builder reads its dataset's own raw layout, so a
+  missing or renamed raw folder fails loudly instead of silently dropping rows. Thai stores
+  every scan twice (once plain, once with a `test_` prefix, byte-identical) and the duplicate
+  copies are dropped. Rerun it whenever the raw data changes.
 * If `data/manifest.csv` is already the file you want, skip the first two commands and start
   at `preprocess_dataset`.
 
