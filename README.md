@@ -52,6 +52,7 @@ Signature-Verification/
 │   └── metrics.py                   Shared FAR / FRR / EER helpers
 ├── preprocessing/
 │   ├── signature_preprocessing.py   Stage 2.2: grayscale normalize + aspect-aware resize
+│   ├── augmentation.py              Training-only augmentation (tilt, pen width, warp, photometric)
 │   ├── build_manifests.py           Build the BHSig260 manifest and merge per-dataset manifests
 │   ├── preprocess_dataset.py        One-time: raw dataset -> 256x512 PNGs + processed manifest
 │   └── demo_outputs.py              Demo: preprocess the sample JPEGs
@@ -61,6 +62,7 @@ Signature-Verification/
 │   ├── evaluate.py                  FAR / FRR / EER on signer-disjoint splits
 │   └── fit_fusion.py                Fit a fusion config on the validation split
 ├── tests/
+│   ├── test_signature_preprocessing.py  Tests for whitening + augmentation
 │   ├── test_stage3_metric_learning.py   Focused tests for sampling and triplet mining
 │   ├── test_handcrafted_features.py     Tests for ink mask, thinning, and pair features
 │   └── test_score_fusion.py             Tests for fusion scoring and EER helpers
@@ -71,8 +73,9 @@ Signature-Verification/
 ### How it works, step by step
 
 1. **Preprocess (stage 2.2).** `preprocess_signature` converts a crop to grayscale
-   (dark ink on white, keeping grayscale stroke intensity), flattens uneven
-   illumination, crops tightly to the ink with a small margin, and resizes without
+   (dark ink on white, keeping grayscale stroke intensity), forces the estimated paper
+   background to pure white while leaving every ink pixel byte-for-byte unchanged,
+   crops tightly to the ink with a small margin, and resizes without
    stretching onto a `512 × 256` white canvas. `to_model_input` then replicates the
    single channel to 3 channels and applies ImageNet normalization, producing the
    `3 × 256 × 512` tensor the model expects. Empty crops raise `ValueError` so they can
@@ -174,11 +177,24 @@ requested number of genuine images for each batch.
 
 By default, images are read as Stage 2.1 outputs and passed through
 `preprocess_signature` using the same Stage 2.2 path as inference. Stage 2.2
-preserves grayscale stroke intensity so pressure and ink flow are not lost and
-whitens the estimated paper background to 255. For already preprocessed 256x512
+preserves the signature's true grayscale stroke intensity so pressure and ink flow
+are not lost: `whiten_background` forces the estimated paper background to pure
+white while returning every ink pixel **unchanged** (it does not rescale ink by the
+local background). For already preprocessed 256x512
 grayscale images, pass `--already-preprocessed`. The preprocessing assumes dark
 signatures on a white or whitish background. The legacy `--ink` option remains
-accepted for compatibility but is ignored.
+accepted for compatibility but is ignored. Pass `background_mode="flatten"` to
+`preprocess_signature` to use the previous flat-field correction instead (kept for
+ablation only).
+
+Training can be augmented with `--augment` (and `--augment-strength light|standard|strong`).
+Augmentation applies to the **training split only** and includes rotation (up to 20° for
+`standard`, simulating a tilted cheque signature), shear, a mild perspective, elastic
+warping, pen stroke width, ink contrast (gamma is off: it duplicates ink contrast), blur, and noise. Each augmented image is
+re-whitened and re-fitted through the same crop + resize as inference, so the
+representation contract is unchanged. BHSig260 (Indic script) automatically receives a
+milder elastic warp, because deforming connected strokes destroys the structure that
+discriminates writers.
 
 ### Train
 

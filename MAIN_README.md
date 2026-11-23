@@ -115,9 +115,10 @@ signers with the requested number of genuine images per batch. Validation
 requires at least two distinct signers with two genuine images each.
 
 By default, the manifest points to upstream Stage 2.1 output images, and the
-dataset applies the project's Stage 2.2 preprocessing path. The path preserves
-grayscale intensity rather than reducing pixels to two levels and whitens the
-estimated paper background to 255. It assumes dark signatures on a white or
+dataset applies the project's Stage 2.2 preprocessing path. The path preserves the
+signature's true grayscale intensity rather than reducing pixels to two levels:
+`whiten_background` forces the estimated paper background to pure white while
+returning every ink pixel unchanged. It assumes dark signatures on a white or
 whitish background; the legacy `--ink` option remains accepted for compatibility
 but is ignored. If files are already preprocessed 256 x 512 grayscale images, pass
 `--already-preprocessed`.
@@ -162,7 +163,18 @@ Useful options:
 --margin FLOAT                    Triplet margin (default 0.3)
 --workers N                       DataLoader workers (default 0)
 --seed N                          Random seed (default 42)
+--augment                         Augment the training split only
+--augment-strength light|standard|strong   Augmentation preset (default standard)
 ```
+
+`--augment` applies tilt (up to 20 degrees for `standard`), shear, a mild perspective,
+elastic warping, pen stroke width, ink contrast (gamma is off: it duplicates ink contrast), blur and noise to the **training
+split only**. Validation and test data are never augmented, because the checkpoint is
+selected by the validation EER. Each augmented image is re-whitened and re-fitted through
+the same crop and resize as inference, so the representation contract is unchanged, and the
+draw is deterministic for a fixed `(--seed, epoch, index)`. BHSig260 automatically receives
+a milder elastic warp, since deforming connected Indic strokes destroys the structure that
+discriminates writers.
 
 For repeatable training, keep the seed, manifest, preprocessing flags, device, and
 software versions unchanged. CPU and supported CUDA runs enable deterministic Torch

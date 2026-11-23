@@ -16,6 +16,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 
+from preprocessing.augmentation import AugmentationConfig, augment_signature
 from preprocessing.signature_preprocessing import (
     load_preprocessed_image,
     to_model_input,
@@ -201,7 +202,14 @@ def dataset_labels(
 
 
 class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
-    """Load signatures, preprocess them, and return model-ready tensors and labels."""
+    """Load signatures, preprocess them, and return model-ready tensors and labels.
+
+    Augmentation is opt-in and must only be enabled for the **training** split. The
+    checkpoint is selected by the validation EER, so augmenting the validation set would
+    corrupt the selector. Augmentation is applied here, after the shared loader and before
+    ``to_model_input``, which keeps the handcrafted-feature branch (which reads the same
+    loader) free of augmented pixels.
+    """
 
     def __init__(
         self,
@@ -210,14 +218,35 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
         *,
         already_preprocessed: bool = False,
         ink: Literal["auto", "light", "dark"] = "auto",
+        augment: bool = False,
+        augment_config: AugmentationConfig | None = None,
+        augment_seed: int = 0,
+        record_datasets: Sequence[str] | None = None,
+        dataset_configs: Mapping[str, AugmentationConfig] | None = None,
     ) -> None:
         self.records = list(records)
         self.signer_to_index = signer_to_index
         self.already_preprocessed = already_preprocessed
         self.ink = ink
+        self.augment = augment
+        self.augment_config = augment_config or AugmentationConfig()
+        self.augment_seed = augment_seed
+        # Optional per-record source dataset and per-dataset config, so a mixed-script
+        # manifest can use a different augmentation for each script.
+        self.record_datasets = list(record_datasets) if record_datasets is not None else None
+        if self.record_datasets is not None and len(self.record_datasets) != len(self.records):
+            raise ValueError("record_datasets must have one label per record")
+        self.dataset_configs = dict(dataset_configs or {})
+        # Bumped by ``set_epoch`` so the augmentation differs each epoch while staying
+        # reproducible for a fixed (seed, epoch, index).
+        self.epoch = 0
 
     def __len__(self) -> int:
         return len(self.records)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Change the augmentation draw for the next epoch."""
+        self.epoch = epoch
 
     def __getitem__(self, index: int) -> tuple[Tensor, int, bool]:
         record = self.records[index]
@@ -228,6 +257,15 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
             already_preprocessed=self.already_preprocessed,
             ink=self.ink,
         )
+        if self.augment:
+            config = self.augment_config
+            if self.record_datasets is not None:
+                # A mixed-script manifest resolves its config per source dataset.
+                config = self.dataset_configs.get(self.record_datasets[index], config)
+            # Seeding from (seed, epoch, index) makes a run reproducible byte for byte
+            # while the augmentation still varies across epochs and samples.
+            rng = np.random.default_rng([self.augment_seed, self.epoch, index])
+            preprocessed = augment_signature(preprocessed, config, rng)
         # The model accepts three channels; preprocessing repeats grayscale for RGB.
         tensor = torch.from_numpy(to_model_input(preprocessed))
         return tensor, self.signer_to_index[record.signer_id], record.is_forgery

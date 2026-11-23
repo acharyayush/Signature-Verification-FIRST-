@@ -82,10 +82,11 @@ def _as_gray(image: np.ndarray) -> np.ndarray:
 def binarize_ink(gray: np.ndarray, threshold: int | None = None) -> np.ndarray:
     """Return a boolean ink mask where ``True`` marks a dark pixel.
 
-    ``threshold`` is a fixed intensity cut. When omitted, an already-binary image (the
-    Stage 2.2 output, whose only values are 0 and 255) uses :data:`INK_THRESHOLD` and
-    anything else uses Otsu's method. An image without ink raises ``ValueError`` so a
-    blank crop is routed to review instead of being scored.
+    ``threshold`` is a fixed intensity cut. When omitted, an already-binary image (whose
+    only values are 0 and 255, as written by ``preprocessing.preprocess_dataset`` without
+    ``--grayscale``) uses :data:`INK_THRESHOLD` and anything else uses Otsu's method. An
+    image without ink raises ``ValueError`` so a blank crop is routed to review instead of
+    being scored.
     """
     grayscale = _as_gray(gray)
     if threshold is not None:

@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from preprocessing.augmentation import STRENGTHS, augmentation_config
 from preprocessing.signature_preprocessing import DEFAULT_TARGET_SIZE
 from scoring.fusion import enroll_and_build_queries, score_queries
 from scoring.metrics import eer_threshold
@@ -224,6 +225,27 @@ def _parse_args() -> argparse.Namespace:
             "under --image-root."
         ),
     )
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help=(
+            "Augment the training split only (rotation/tilt, shear, mild perspective, "
+            "elastic warp, pen stroke width, ink contrast, blur, noise). Validation "
+            "and test data are never augmented, because the checkpoint is selected by the "
+            "validation EER. Each augmented image is re-whitened and re-fitted through the "
+            "same crop + resize as inference, so the representation contract is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--augment-strength",
+        choices=STRENGTHS,
+        default="standard",
+        help=(
+            "Augmentation preset used with --augment. 'standard' tilts up to 20 degrees; "
+            "'light' up to 10; 'strong' up to 26. BHSig260 (Indic script) automatically "
+            "gets a milder elastic warp, which would otherwise destroy meaningful strokes."
+        ),
+    )
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -255,13 +277,13 @@ def main() -> None:
     # Optional dataset-balanced signer sampling. Signers are otherwise sampled uniformly,
     # so a dataset that holds more signers contributes proportionally more of every batch
     # and its script dominates the gradient.
+    image_root = (
+        Path(args.image_root).expanduser().resolve()
+        if args.image_root
+        else Path(args.manifest).expanduser().resolve().parent
+    )
     signer_groups: dict[str, str] = {}
     if args.balance_datasets:
-        image_root = (
-            Path(args.image_root).expanduser().resolve()
-            if args.image_root
-            else Path(args.manifest).expanduser().resolve().parent
-        )
         labels = dataset_labels(train_records + validation_records, image_root)
         signer_groups = {
             record.signer_id: label
@@ -275,12 +297,42 @@ def main() -> None:
             f"{sorted(per_dataset.items())}"
         )
 
+    # Training-only augmentation. The config is resolved per source dataset so an Indic
+    # script (BHSig260) gets a milder elastic warp than a Latin one (CEDAR), which would
+    # otherwise destroy the connected strokes that discriminate writers.
+    train_record_datasets: list[str] | None = None
+    augment_configs: dict[str, AugmentationConfig] = {}
+    if args.augment:
+        try:
+            train_record_datasets = dataset_labels(train_records, image_root)
+            augment_configs = {
+                label: augmentation_config(args.augment_strength, dataset=label)
+                for label in sorted(set(train_record_datasets))
+            }
+        except ValueError as error:
+            # Labels come from the processed layout. When it cannot be resolved the
+            # augmentation still runs, with one config for every record.
+            train_record_datasets = None
+            augment_configs = {}
+            print(f"warning: per-dataset augmentation configs unavailable ({error}); "
+                  "using one config for all records")
+        print(
+            f"Augmentation: strength={args.augment_strength}, "
+            f"datasets={sorted(augment_configs) or ['<all>']}"
+        )
+
     train_dataset = SignatureDataset(
         train_records,
         signer_to_index,
         already_preprocessed=args.already_preprocessed,
         ink=args.ink,
+        augment=args.augment,
+        augment_config=augmentation_config(args.augment_strength),
+        augment_seed=args.seed,
+        record_datasets=train_record_datasets,
+        dataset_configs=augment_configs,
     )
+    # Validation is never augmented: the checkpoint is selected by the validation EER.
     validation_dataset = SignatureDataset(
         validation_records,
         signer_to_index,
@@ -368,6 +420,9 @@ def main() -> None:
         )
         for phase_epoch in range(epoch_count):
             train_sampler.set_epoch(global_epoch)
+            # Vary the augmentation draw per epoch; the per-sample seed makes it
+            # reproducible for a fixed (--seed, epoch, index).
+            train_dataset.set_epoch(global_epoch)
             train_metrics = _run_epoch(
                 model,
                 train_loader,
@@ -446,6 +501,11 @@ def main() -> None:
                             "already_preprocessed": args.already_preprocessed,
                             "ink": args.ink,
                             "target_size": list(DEFAULT_TARGET_SIZE),
+                            # Stage 2.2 default: true grayscale ink preserved, paper
+                            # background forced to pure white.
+                            "background_mode": "whiten",
+                            "augment": args.augment,
+                            "augment_strength": args.augment_strength if args.augment else None,
                         },
                     },
                     checkpoint_path,

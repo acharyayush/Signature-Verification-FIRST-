@@ -47,10 +47,12 @@ so it lands in `[0, 1]`.
 
 ### Skeleton and topology
 
-`binarize_ink` produces a boolean ink mask. For an already-binary image (the Stage 2.2
-output, whose only values are 0 and 255) it applies the fixed cut
+`binarize_ink` produces a boolean ink mask. For an already-binary image (whose only
+values are 0 and 255, as written by `preprocessing.preprocess_dataset` without
+`--grayscale`) it applies the fixed cut
 `INK_THRESHOLD = 200`; for any other grayscale image it falls back to Otsu's method.
-Because Stage 2.2 output is dark ink on a whitened background, the fixed cut is safe
+Because Stage 2.2 output is dark ink on a pure-white background -- grayscale strokes are
+preserved by default and only the background is forced to 255 -- the fixed cut is safe
 there and avoids re-estimating Otsu per image. An image with no ink raises
 `ValueError` so a blank crop is routed to review instead of being scored.
 
