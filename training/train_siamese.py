@@ -166,7 +166,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--already-preprocessed",
         action="store_true",
-        help="Input files are already 256x512 Stage 2 output images",
+        help="Input files are already Stage 2.2 output images (default 384x192)",
     )
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--phase1-epochs", type=int, default=5)
@@ -229,11 +229,12 @@ def _parse_args() -> argparse.Namespace:
         "--augment",
         action="store_true",
         help=(
-            "Augment the training split only (rotation/tilt, shear, mild perspective, "
-            "elastic warp, pen stroke width, ink contrast, blur, noise). Validation "
-            "and test data are never augmented, because the checkpoint is selected by the "
-            "validation EER. Each augmented image is re-whitened and re-fitted through the "
-            "same crop + resize as inference, so the representation contract is unchanged."
+            "Augment the training split only. Four transforms, one per real-world cause: "
+            "rotation (cheque tilt), stroke width (a different pen), ink contrast (pen "
+            "pressure) and blur (scan quality). Validation and test data are never "
+            "augmented, because the checkpoint is selected by the validation EER. Each "
+            "augmented image is re-whitened and re-fitted through the same crop + resize as "
+            "inference, so the representation contract is unchanged."
         ),
     )
     parser.add_argument(
@@ -242,8 +243,7 @@ def _parse_args() -> argparse.Namespace:
         default="standard",
         help=(
             "Augmentation preset used with --augment. 'standard' tilts up to 20 degrees; "
-            "'light' up to 10; 'strong' up to 26. BHSig260 (Indic script) automatically "
-            "gets a milder elastic warp, which would otherwise destroy meaningful strokes."
+            "'light' up to 10; 'strong' up to 26."
         ),
     )
     parser.add_argument("--workers", type=int, default=0)
@@ -297,29 +297,10 @@ def main() -> None:
             f"{sorted(per_dataset.items())}"
         )
 
-    # Training-only augmentation. The config is resolved per source dataset so an Indic
-    # script (BHSig260) gets a milder elastic warp than a Latin one (CEDAR), which would
-    # otherwise destroy the connected strokes that discriminate writers.
-    train_record_datasets: list[str] | None = None
-    augment_configs: dict[str, AugmentationConfig] = {}
+    # Training-only augmentation: rotation, stroke width, ink contrast and blur. One config
+    # for every record, because none of the four transforms is script-specific.
     if args.augment:
-        try:
-            train_record_datasets = dataset_labels(train_records, image_root)
-            augment_configs = {
-                label: augmentation_config(args.augment_strength, dataset=label)
-                for label in sorted(set(train_record_datasets))
-            }
-        except ValueError as error:
-            # Labels come from the processed layout. When it cannot be resolved the
-            # augmentation still runs, with one config for every record.
-            train_record_datasets = None
-            augment_configs = {}
-            print(f"warning: per-dataset augmentation configs unavailable ({error}); "
-                  "using one config for all records")
-        print(
-            f"Augmentation: strength={args.augment_strength}, "
-            f"datasets={sorted(augment_configs) or ['<all>']}"
-        )
+        print(f"Augmentation: strength={args.augment_strength}")
 
     train_dataset = SignatureDataset(
         train_records,
@@ -329,8 +310,6 @@ def main() -> None:
         augment=args.augment,
         augment_config=augmentation_config(args.augment_strength),
         augment_seed=args.seed,
-        record_datasets=train_record_datasets,
-        dataset_configs=augment_configs,
     )
     # Validation is never augmented: the checkpoint is selected by the validation EER.
     validation_dataset = SignatureDataset(

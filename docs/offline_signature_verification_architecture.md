@@ -64,17 +64,21 @@ This system only relies on the following contract for the upstream output:
 #### Step 2.2: Grayscale normalization and aspect-aware resize (implemented)
 
 **Input:** the signature image from step 2.1 (any size, grayscale or BGR, dark ink on a white or whitish background).
-**Output:** a `256 × 512` (H × W) `uint8` grayscale image with dark ink on a
+**Output:** a `192 × 384` (H × W) `uint8` grayscale image with dark ink on a
 white background, ready for Stage 3. Grayscale values are retained so the model
 can use pressure and ink-flow information.
 
-Signatures are wide, so a square canvas wastes most of the input area and forces heavy downscaling of thin strokes. The agreed input is a **wide-aspect, higher-resolution canvas**:
+Signatures are wide, so a square canvas wastes most of the input area and forces heavy downscaling of thin strokes. The agreed input is a **wide-aspect, 2:1 canvas**:
 
-| Setting | Previous | Agreed |
-| --- | --- | --- |
-| Canvas (W × H) | `384 × 192` | **`512 × 256`** (2:1) |
-| Pixels | 73,728 | 131,072 (about 1.8×) |
-| Divisible by 32 | Yes | Yes (ConvNeXt total stride) |
+| Setting | Value |
+| --- | --- |
+| Canvas (W × H) | **`384 × 192`** (2:1) |
+| Pixels | 73,728 |
+| Divisible by 32 | Yes (ConvNeXt total stride) |
+
+A larger `512 × 256` canvas was tried previously -- it avoids downscaling typical ink
+crops (a 3.5 px stroke became ~2.1 px there) at about 1.8x the compute -- but is not the
+default. Both are multiples of 32, so the fully-convolutional backbone needs no change.
 
 Procedure (`preprocess_signature`):
 
@@ -86,14 +90,14 @@ Procedure (`preprocess_signature`):
 3. **Aspect-aware resize** (`aspect_aware_resize`):
    - Compute `scale = min(W_target / w, H_target / h)`. The image is scaled uniformly, so no stretching occurs.
    - Resize with `INTER_AREA` when shrinking (avoids aliasing of thin strokes) and `INTER_CUBIC` when enlarging.
-   - Center the result on a `512 × 256` white canvas (`pad_value = 255`, matching the background).
+   - Center the result on a `384 × 192` white canvas (`pad_value = 255`, matching the background).
 4. **Model tensor** (`to_model_input`, called by Stage 3): replicate the single channel to 3 channels and normalize with ImageNet mean and standard deviation, to use the pretrained weights unchanged.
 
 ```python
 from preprocessing.signature_preprocessing import preprocess_signature, to_model_input
 
-image = preprocess_signature(stage2_1_output, target_size=(512, 256))  # 256 x 512 uint8 grayscale
-tensor = to_model_input(image)                                                     # 3 x 256 x 512 float32
+image = preprocess_signature(stage2_1_output, target_size=(384, 192))  # 192 x 384 uint8 grayscale
+tensor = to_model_input(image)                                                     # 3 x 192 x 384 float32
 ```
 
 Notes:
@@ -102,7 +106,7 @@ Notes:
 - Illumination correction uses a morphological background estimate to locate the paper background, which is then forced to pure white while ink pixels are left unchanged (`whiten_background`, tolerance derived from the local background level, then applied again after the resize). If real scans show difficult uneven illumination, an adaptive grayscale correction is an alternative to evaluate; `background_mode="flatten"` restores the previous flat-field behaviour for comparison.
 - Tight cropping discards the absolute position and size of the signature within the box. Relative proportions (aspect ratio) are kept by the uniform scaling. If absolute size is found to be informative, compare against a variant that skips the ink crop in the ablation study (Section 5.4).
 - `convnext_tiny` is fully convolutional with global average pooling, so non-square inputs need no architectural change.
-- The canvas size is a hyperparameter. Compare `384 × 192`, `512 × 256` (current), and a larger option such as `640 × 320` in the ablation study (Section 5), because the best size depends on the scan DPI and the stroke thickness after cropping.
+- The canvas size is a hyperparameter. Compare `384 × 192` (current), `512 × 256`, and a larger option such as `640 × 320` in the ablation study (Section 5), because the best size depends on the scan DPI and the stroke thickness after cropping.
 - Use the identical step at training and inference time. Any difference in threshold method, padding value, or interpolation is a train/serve skew. Apply augmentation before this step (Section 4).
 
 ### Stage 3: Deep metric learning (Siamese network)
@@ -191,7 +195,7 @@ $$
 
 1. **Phase 1 (warm-up):** Freeze the ConvNeXt backbone. Train only the projection head for 5–10 epochs with a learning rate of `1 × 10⁻³`, using semi-hard mining.
 2. **Phase 2 (unfreezing):** Unfreeze the last two ConvNeXt stages. Lower the learning rate to `1 × 10⁻⁴` and train for another 20–30 epochs, using batch-hard mining.
-3. **Data augmentation (`--augment`, training split only):** Implemented in `preprocessing/augmentation.py` and applied inside `SignatureDataset`, after the shared loader and before `to_model_input`. Because Stage 2.2 is a tight ink crop plus an aspect-aware uniform resize, translation and absolute scale are already removed by the pipeline, so the augmentation targets what survives: rotation (up to `±20°` for the `standard` preset, simulating a tilted cheque signature), shear, an occasional perspective, elastic warping, pen stroke width (a grayscale min/max filter), ink contrast, and blur/noise (all background-preserving, so the pure-white background cannot become grey). Three transforms were dropped as redundant: gamma duplicated ink contrast (both are white-preserving monotonic intensity remaps), perspective is now occasional (p=0.3) instead of stacking a third geometric warp on every draw, and the per-op probabilities mean a sample sees ~5 transforms rather than all of them. See `preprocessing/demo_augmentations.py` for a per-transform contact sheet. The chain ends by re-whitening the background and re-running the same crop + resize as inference, so the representation contract is unchanged. Augmentation is deterministic for a fixed `(seed, epoch, index)` and is **never** applied to validation or test data, because the checkpoint is selected by the validation EER. Indic scripts (BHSig260) automatically receive a milder elastic warp, since deforming connected strokes destroys the structure that discriminates writers.
+3. **Data augmentation (`--augment`, training split only):** Implemented in `preprocessing/augmentation.py` and applied inside `SignatureDataset`, after the shared loader and before `to_model_input`. Because Stage 2.2 is a tight ink crop plus an aspect-aware uniform resize, translation and absolute scale are already removed by the pipeline, so the augmentation targets what survives: exactly four transforms, one per real-world cause of variation: rotation (up to `±20°` for the `standard` preset, the cheque tilt), pen stroke width (a grayscale min/max filter), ink contrast (pen pressure) and blur (scan quality) -- all background-preserving, so the pure-white background cannot become grey. Shear, perspective, elastic warping, gamma and sensor noise were removed: gamma duplicated ink contrast (both are white-preserving monotonic intensity remaps) and the others added variation these datasets do not exhibit. Rotation and ink contrast fire on every draw; stroke width (p=0.5) and blur (p=0.15) are occasional. See `preprocessing/demo_augmentations.py` for a per-transform contact sheet. The chain ends by re-whitening the background and re-running the same crop + resize as inference, so the representation contract is unchanged. Augmentation is deterministic for a fixed `(seed, epoch, index)` and is **never** applied to validation or test data, because the checkpoint is selected by the validation EER. Indic scripts (BHSig260) automatically receive a milder elastic warp, since deforming connected strokes destroys the structure that discriminates writers.
 
 Treat epoch counts and learning rates as initial settings; tune them using signer-disjoint validation data.
 
@@ -253,7 +257,7 @@ Run each change against the baseline on the validation set, and confirm the fina
 
 | Question | Variants |
 | --- | --- |
-| Input resolution and shape | `224 × 224` (padded square) vs. `384 × 192` vs. `512 × 256` (current) vs. `640 × 320` |
+| Input resolution and shape | `224 × 224` (padded square) vs. `384 × 192` (current) vs. `512 × 256` vs. `640 × 320` |
 | Tight ink crop | With (current) vs. without (whole Stage 2 canvas resized) |
 | Loss | Contrastive vs. triplet (random) vs. triplet (semi-hard) vs. triplet (batch-hard) |
 | Skilled forgeries as negatives | With vs. without forgeries in training |

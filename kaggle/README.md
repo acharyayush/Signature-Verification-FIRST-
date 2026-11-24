@@ -25,7 +25,7 @@ notebook. The cells are:
 
 Stage 2.2 is CPU work and only needs to happen once. Do it on your machine, not on Kaggle.
 The output must use the **current** preprocessing: pure-white background, true grayscale ink
-preserved, `256 x 512` canvas.
+preserved, `192 x 384` canvas.
 
 ```bash
 # raw -> data/manifests/*.csv (per dataset) ; then merge the ones you want
@@ -82,9 +82,9 @@ so `--manifest /kaggle/input/.../manifest.csv` resolves every image.
 
 ## 3. Notes
 
-- **Augmentation set.** Tilt (up to 20 deg), shear, occasional perspective, elastic, pen
-  stroke width, ink contrast, blur and noise. Gamma is off because it duplicates ink
-  contrast; most transforms fire with a probability, so a sample sees ~5 of them.
+- **Augmentation set.** Exactly four transforms: rotation (tilt, up to 20 deg), pen stroke
+  width, ink contrast and blur. Rotation and ink contrast fire on every sample; stroke
+  width (p=0.5) and blur (p=0.15) are occasional.
 - **Augmentation is training-only.** Validation is never augmented, because the checkpoint is
   selected by the validation EER. Each augmented image is re-whitened and re-fitted through the
   same crop + resize as inference.

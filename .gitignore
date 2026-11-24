@@ -7,3 +7,7 @@ checkpoints/
 # Model weights: a stray best_model.pt (~110 MB) was nearly committed from the repo root.
 *.pt
 *.pth
+# Generated demo output (160+ PNGs): rebuild with `python -m preprocessing.demo_augmentations`.
+augmentation_samples/
+# 69 MB generated benchmark (~450 images): rebuild with `python -m scripts.build_ultimate_test_signs`.
+Ultimate Test Signs/

@@ -5,14 +5,15 @@ Usage (from the repository root):
 
 Picks 10 different signatures from ``data/raw`` (CEDAR, BHSig260 Bengali and Hindi,
 SigResize), preprocesses each with the current Stage 2.2 path (pure-white background, true
-grayscale ink), then applies **every** augmentation individually plus two full random draws.
-One PNG per ``(operation, source)`` is written to ``augmentation_samples/<operation>/`` and a
-master contact sheet to ``augmentation_samples/contact_sheet.png``, so the effect of every
-transform can be inspected by eye.
+grayscale ink), then applies each of the four training augmentations individually plus two
+full random draws. One PNG per ``(operation, source)`` is written to
+``augmentation_samples/<operation>/`` and a master contact sheet to
+``augmentation_samples/contact_sheet.png``, so the effect of every transform can be inspected
+by eye.
 
 Every transform goes through the same helpers the training dataset uses, and each result is
 re-whitened and re-fitted through the inference crop + resize, so what is shown here is
-exactly the ``512 x 256`` image training would see -- not an intermediate.
+exactly the Stage 2.2 image training would see -- not an intermediate.
 """
 
 from __future__ import annotations
@@ -24,12 +25,8 @@ import cv2
 import numpy as np
 
 from preprocessing.augmentation import (
-    _apply_affine,
-    _apply_elastic,
-    _apply_gamma,
     _apply_ink_contrast,
-    _apply_noise,
-    _apply_perspective,
+    _apply_rotation,
     _apply_stroke_width,
     augment_signature,
     augmentation_config,
@@ -107,22 +104,17 @@ def _pick_sources(seed: int = 7) -> list[tuple[str, Path, str]]:
     return chosen
 
 
-def _operations(image: np.ndarray, index: int, dataset: str | None) -> dict[str, np.ndarray]:
-    """Every augmentation applied to one preprocessed signature, already re-fitted.
+def _operations(image: np.ndarray, index: int) -> dict[str, np.ndarray]:
+    """The four training augmentations applied individually, plus two full random draws.
 
-    Each entry is the ``512 x 256`` image training would see, so the sheet shows the real
-    effect rather than an intermediate transform. ``dataset`` selects the per-dataset preset
-    for the two full random draws (BHSig260 gets the milder elastic warp).
+    Each entry is the Stage 2.2 image training would see, so the sheet shows the real effect
+    rather than an intermediate transform.
     """
-    rng = np.random.default_rng(1000 + index)
     return {
         "original": _refit(image),
-        "rotate_-20deg": _refit(_apply_affine(image, -20.0, 0.0, fill=255)),
-        "rotate_+10deg": _refit(_apply_affine(image, 10.0, 0.0, fill=255)),
-        "rotate_+20deg": _refit(_apply_affine(image, 20.0, 0.0, fill=255)),
-        "shear_+8deg": _refit(_apply_affine(image, 0.0, 8.0, fill=255)),
-        "perspective": _refit(_apply_perspective(image, 0.02, rng, fill=255)),
-        "elastic": _refit(_apply_elastic(image, 4.0, 10.0, rng, fill=255)),
+        "rotate_-20deg": _refit(_apply_rotation(image, -20.0, fill=255)),
+        "rotate_+10deg": _refit(_apply_rotation(image, 10.0, fill=255)),
+        "rotate_+20deg": _refit(_apply_rotation(image, 20.0, fill=255)),
         "stroke_thicker": _refit(
             _apply_stroke_width(image, 3, _FixedGenerator(random_value=0.0))
         ),
@@ -135,23 +127,13 @@ def _operations(image: np.ndarray, index: int, dataset: str | None) -> dict[str,
         "ink_lighter": _refit(
             _apply_ink_contrast(image, 0.25, _FixedGenerator(uniform_value=-0.25))
         ),
-        # Kept for reference only: gamma is OFF in training because it duplicates
-        # ink_contrast (both are white-preserving monotonic intensity remaps).
-        "gamma_off_in_training": _refit(
-            _apply_gamma(image, 0.15, _FixedGenerator(uniform_value=0.15))
-        ),
         "blur": _refit(cv2.GaussianBlur(image, (0, 0), 1.2)),
-        "noise": _refit(_apply_noise(image, 4.0, rng)),
         # The two full draws go through ``augment_signature``, which re-fits internally.
         "full_random_standard": augment_signature(
-            image,
-            augmentation_config("standard", dataset=dataset),
-            np.random.default_rng([42, 0, index]),
+            image, augmentation_config("standard"), np.random.default_rng([42, 0, index])
         ),
         "full_random_strong": augment_signature(
-            image,
-            augmentation_config("strong", dataset=dataset),
-            np.random.default_rng([42, 0, index]),
+            image, augmentation_config("strong"), np.random.default_rng([42, 0, index])
         ),
     }
 
@@ -212,7 +194,7 @@ def _write_readme(
         "operations, columns are the 10 source signatures.",
         "",
         "Every sub-directory holds one PNG per source. Each image is already re-whitened and",
-        "re-fitted through the inference crop + resize, so it is exactly the 512x256 image",
+        "re-fitted through the inference crop + resize, so it is exactly the Stage 2.2 image",
         "training would see.",
         "",
         "## Operations",
@@ -223,25 +205,19 @@ def _write_readme(
     lines += [f"- `{label}` ({dataset}) <- `{path}`" for label, path, dataset in sources]
     lines += [
         "",
-        "## Where does training actually use these?",
+        "## The four training augmentations",
         "",
-        "Only the operations enabled by the `standard` preset are used, and most fire with a",
-        "probability, so a sample sees roughly 5 of them rather than all 17. This sheet shows",
-        "each one in isolation so its effect is visible; training samples one random draw per",
-        "sample per epoch.",
+        "One transform per real-world cause of variation, and nothing else. Rotation and ink",
+        "contrast fire on every sample; stroke width and blur fire with a probability, so a",
+        "sample sees 2-4 of them. Training samples one random draw per sample per epoch.",
         "",
-        "| operation | used in training? | axis |",
+        "| operation | fires | cause it models |",
         "| --- | --- | --- |",
-        "| `rotate_*` | yes (always) | cheque tilt |",
-        "| `shear_+8deg` | yes (always) | scan skew |",
-        "| `ink_darker` / `ink_lighter` | yes (always, random sign) | pen darkness |",
-        "| `stroke_thicker` / `stroke_thinner` | yes (p=0.5) | pen width |",
-        "| `perspective` | yes (p=0.3) | photo skew |",
-        "| `elastic` | yes (p=0.3) | handwriting wobble |",
-        "| `blur` | yes (p=0.15) | scan quality |",
-        "| `noise` | yes (p=0.15) | scan quality |",
-        "| `gamma_off_in_training` | **no** | duplicates ink contrast |",
-        "| `full_random_standard` / `full_random_strong` | yes | the real draws |",
+        "| `rotate_*` | always | the cheque signature is tilted by hand |",
+        "| `ink_darker` / `ink_lighter` | always (random sign) | pen pressure / ink darkness |",
+        "| `stroke_thicker` / `stroke_thinner` | p=0.5 | a different pen |",
+        "| `blur` | p=0.15 | a soft scan or photo |",
+        "| `full_random_standard` / `full_random_strong` | the real draws | all four combined |",
     ]
     lines.append("")
     (output_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
@@ -261,7 +237,7 @@ def save_augmentation_samples(
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
             raise FileNotFoundError(f"could not read signature image: {path}")
-        operations = _operations(preprocess_signature(image), index - 1, dataset)
+        operations = _operations(preprocess_signature(image), index - 1)
         results[label] = operations
         for name, array in operations.items():
             folder = out / name

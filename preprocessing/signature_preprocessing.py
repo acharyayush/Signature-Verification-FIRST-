@@ -20,9 +20,11 @@ import cv2
 import numpy as np
 
 # Agreed input size (width, height): 2:1 and a multiple of 32 (ConvNeXt total stride).
-# 512 x 256 stops the ~0.6x downscale that 384 x 192 applied to typical ink crops
-# (a 3.5 px stroke became ~2.1 px), while keeping the 2:1 aspect the datasets share.
-DEFAULT_TARGET_SIZE = (512, 256)
+# 384 x 192 is the default. 512 x 256 was tried first to avoid downscaling typical ink
+# crops (a 3.5 px stroke became ~2.1 px there), but it is reverted here to keep the
+# cheaper canvas. Both are multiples of 32, so the fully-convolutional backbone needs no
+# architectural change either way.
+DEFAULT_TARGET_SIZE = (384, 192)
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)

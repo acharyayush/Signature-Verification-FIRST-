@@ -221,8 +221,6 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
         augment: bool = False,
         augment_config: AugmentationConfig | None = None,
         augment_seed: int = 0,
-        record_datasets: Sequence[str] | None = None,
-        dataset_configs: Mapping[str, AugmentationConfig] | None = None,
     ) -> None:
         self.records = list(records)
         self.signer_to_index = signer_to_index
@@ -231,12 +229,6 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
         self.augment = augment
         self.augment_config = augment_config or AugmentationConfig()
         self.augment_seed = augment_seed
-        # Optional per-record source dataset and per-dataset config, so a mixed-script
-        # manifest can use a different augmentation for each script.
-        self.record_datasets = list(record_datasets) if record_datasets is not None else None
-        if self.record_datasets is not None and len(self.record_datasets) != len(self.records):
-            raise ValueError("record_datasets must have one label per record")
-        self.dataset_configs = dict(dataset_configs or {})
         # Bumped by ``set_epoch`` so the augmentation differs each epoch while staying
         # reproducible for a fixed (seed, epoch, index).
         self.epoch = 0
@@ -258,14 +250,10 @@ class SignatureDataset(Dataset[tuple[Tensor, int, bool]]):
             ink=self.ink,
         )
         if self.augment:
-            config = self.augment_config
-            if self.record_datasets is not None:
-                # A mixed-script manifest resolves its config per source dataset.
-                config = self.dataset_configs.get(self.record_datasets[index], config)
             # Seeding from (seed, epoch, index) makes a run reproducible byte for byte
             # while the augmentation still varies across epochs and samples.
             rng = np.random.default_rng([self.augment_seed, self.epoch, index])
-            preprocessed = augment_signature(preprocessed, config, rng)
+            preprocessed = augment_signature(preprocessed, self.augment_config, rng)
         # The model accepts three channels; preprocessing repeats grayscale for RGB.
         tensor = torch.from_numpy(to_model_input(preprocessed))
         return tensor, self.signer_to_index[record.signer_id], record.is_forgery

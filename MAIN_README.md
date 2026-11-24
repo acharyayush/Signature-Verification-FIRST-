@@ -16,7 +16,7 @@ decision system.
 | 4. Scoring and verification | Compare embeddings with cosine similarity and evaluate a policy on representative data. | Similarity helper implemented; thresholds and deployment evaluation require project data |
 
 The Stage 2 output expected by Stage 3 is a 512 px wide, 256 px high grayscale
-image (`H x W = 256 x 512`, `target_size = (width, height) = (512, 256)`) with
+image (`H x W = 192 x 384`, `target_size = (width, height) = (384, 192)`) with
 dark ink on a white background. Grayscale intensity is retained to represent
 stroke pressure and ink flow. The preprocessing module converts this to an
 ImageNet-normalized PyTorch tensor in `C x H x W` order: 3 channels, 256 high,
@@ -120,7 +120,7 @@ signature's true grayscale intensity rather than reducing pixels to two levels:
 `whiten_background` forces the estimated paper background to pure white while
 returning every ink pixel unchanged. It assumes dark signatures on a white or
 whitish background; the legacy `--ink` option remains accepted for compatibility
-but is ignored. If files are already preprocessed 256 x 512 grayscale images, pass
+but is ignored. If files are already preprocessed 192 x 384 grayscale images, pass
 `--already-preprocessed`.
 
 ### Public-dataset preprocessing (black and white)
@@ -128,7 +128,7 @@ but is ignored. If files are already preprocessed 256 x 512 grayscale images, pa
 Public datasets are prepared once with `python -m preprocessing.build_manifests`
 (per-dataset signer splits in `data/manifests/`, merged into `data/manifest.csv`) and
 `python -m preprocessing.preprocess_dataset` (writes `data/processed/`). This step
-writes pure black-and-white (0/255) 256 x 512 PNGs by default, because BHSig260 is
+writes pure black-and-white (0/255) 192 x 384 PNGs by default, because BHSig260 is
 already binary; pass `--grayscale` to keep grayscale strokes. Training and inference
 must use matching preprocessing.
 
@@ -153,7 +153,7 @@ Useful options:
 --image-root PATH                 Base directory for relative image paths
 --device auto|cpu|cuda|mps        Compute device (auto: CUDA, otherwise CPU)
 --ink auto|light|dark             Legacy compatibility option; ignored
---already-preprocessed            Require 256x512 grayscale input files
+--already-preprocessed            Require Stage 2.2 grayscale input files
 --no-pretrained                   Initialize ConvNeXt without pretrained weights
 --phase1-epochs N                 Warm-up epochs (default 5)
 --phase2-epochs N                 Fine-tuning epochs (default 20)
@@ -167,14 +167,12 @@ Useful options:
 --augment-strength light|standard|strong   Augmentation preset (default standard)
 ```
 
-`--augment` applies tilt (up to 20 degrees for `standard`), shear, a mild perspective,
-elastic warping, pen stroke width, ink contrast (gamma is off: it duplicates ink contrast), blur and noise to the **training
-split only**. Validation and test data are never augmented, because the checkpoint is
+`--augment` applies exactly four transforms to the **training split only**: rotation (tilt,
+up to 20 degrees for `standard`), pen stroke width, ink contrast (pen pressure) and blur
+(scan quality). Validation and test data are never augmented, because the checkpoint is
 selected by the validation EER. Each augmented image is re-whitened and re-fitted through
 the same crop and resize as inference, so the representation contract is unchanged, and the
-draw is deterministic for a fixed `(--seed, epoch, index)`. BHSig260 automatically receives
-a milder elastic warp, since deforming connected Indic strokes destroys the structure that
-discriminates writers.
+draw is deterministic for a fixed `(--seed, epoch, index)`.
 
 For repeatable training, keep the seed, manifest, preprocessing flags, device, and
 software versions unchanged. CPU and supported CUDA runs enable deterministic Torch

@@ -6,7 +6,7 @@ These pin the two contracts the training pipeline now depends on:
   is forced to pure white while every ink pixel is returned byte-for-byte unchanged, so
   the signature's true grayscale (pen pressure, ink flow) survives;
 * :func:`preprocessing.augmentation.augment_signature` -- augmentation is deterministic for
-  a fixed seed, keeps the ``256 x 512`` canvas and the pure-white background, and is only
+  a fixed seed, keeps the canvas size and the pure-white background, and is only
   reachable through ``SignatureDataset(augment=True)`` (never validation).
 """
 
@@ -24,9 +24,8 @@ from preprocessing.augmentation import (
     MIN_INK_PIXELS,
     STRENGTHS,
     AugmentationConfig,
-    _apply_elastic,
+    _apply_rotation,
     _apply_stroke_width,
-    _elastic_offsets,
     augment_signature,
     augmentation_config,
 )
@@ -89,7 +88,7 @@ class _FixedRandom:
         return self.random_value
 
     def uniform(self, low: float = 0.0, high: float = 1.0, size=None):
-        # Clipped to the requested bounds so a zero-width range (e.g. shear 0) stays 0.
+        # Clipped to the requested bounds so a zero-width range stays at zero.
         value = float(np.clip(self.uniform_value, low, high))
         return np.full(size, value) if size is not None else value
 
@@ -101,14 +100,9 @@ def _geometry_only_config(**overrides) -> AugmentationConfig:
     """A config with every transform disabled, so a test can enable exactly one."""
     disabled = dict(
         rotate_degrees=0.0,
-        shear_degrees=0.0,
-        perspective=0.0,
-        elastic_probability=0.0,
         stroke_width_probability=0.0,
         ink_contrast=0.0,
-        gamma=0.0,
         blur_probability=0.0,
-        noise_probability=0.0,
     )
     disabled.update(overrides)
     return AugmentationConfig(**disabled)
@@ -117,7 +111,7 @@ def _geometry_only_config(**overrides) -> AugmentationConfig:
 def _wide_bar() -> np.ndarray:
     """A wide, low ink bar: rotation visibly changes its bounding-box aspect."""
     image = np.full((HEIGHT, WIDTH), 255, dtype=np.uint8)
-    cv2.rectangle(image, (100, 80), (400, 180), INK_LEVEL, -1)
+    cv2.rectangle(image, (70, 50), (310, 140), INK_LEVEL, -1)
     return image
 
 
@@ -238,7 +232,7 @@ class AugmentationTests(unittest.TestCase):
         self.assertFalse(np.array_equal(epoch0, other))
 
     def test_rotation_changes_the_bounding_box_aspect(self) -> None:
-        # A 30 degree tilt must change the ink geometry, not merely resample it.
+        # A 20 degree tilt must change the ink geometry, not merely resample it.
         rotated = augment_signature(
             _wide_bar(),
             _geometry_only_config(rotate_degrees=20.0),
@@ -275,32 +269,23 @@ class AugmentationTests(unittest.TestCase):
         self.assertEqual(augmentation_config("standard").rotate_degrees, 20.0)
         self.assertEqual(AugmentationConfig().rotate_degrees, 20.0)
 
-    def test_bhsig_preset_uses_milder_elastic(self) -> None:
-        default = augmentation_config("standard")
-        indic = augmentation_config("standard", dataset="BHSig260")
-        self.assertLess(indic.elastic_alpha, default.elastic_alpha)
-        self.assertLess(indic.shear_degrees, default.shear_degrees)
-
-    def test_unknown_dataset_keeps_the_strength_preset(self) -> None:
+    def test_config_exposes_only_the_four_transforms(self) -> None:
+        # Guards the "remove the others" decision: shear, perspective, elastic, gamma and
+        # noise must not come back without a deliberate change here.
         self.assertEqual(
-            augmentation_config("standard", dataset="CEDAR").elastic_alpha,
-            augmentation_config("standard").elastic_alpha,
+            set(AugmentationConfig().__dict__),
+            {
+                "rotate_degrees",
+                "stroke_width_probability",
+                "stroke_width_kernel",
+                "ink_contrast",
+                "blur_probability",
+                "blur_sigma",
+                "fill",
+                "refit",
+                "target_size",
+            },
         )
-
-    def test_elastic_actually_moves_the_ink(self) -> None:
-        # Regression: the displacement field was normalised noise times a nominal alpha of
-        # 1, so the ink moved by ~0.2 px and elastic was effectively a no-op. alpha is now
-        # the peak displacement in pixels, so the ink mask must visibly shift.
-        image = _signature_image()
-        warped = _apply_elastic(image, 4.0, 10.0, np.random.default_rng(0), fill=255)
-        before, after = image < 200, warped < 200
-        overlap = float((before & after).sum()) / max(int((before | after).sum()), 1)
-        self.assertLess(overlap, 0.95, "elastic warp barely moved the ink")
-
-    def test_elastic_displacement_is_bounded_by_alpha(self) -> None:
-        offsets_x, offsets_y = _elastic_offsets(128, 128, 5.0, 10.0, np.random.default_rng(0))
-        self.assertAlmostEqual(float(np.abs(offsets_x).max()), 5.0, places=4)
-        self.assertAlmostEqual(float(np.abs(offsets_y).max()), 5.0, places=4)
 
     def test_photometric_stage_preserves_a_dark_ink_contract(self) -> None:
         # Regression: thinning + blur + lightening once combined to lift every ink pixel
@@ -359,7 +344,7 @@ class SignatureDatasetAugmentationTests(unittest.TestCase):
             )
             self.assertFalse(np.array_equal(plain[0][0].numpy(), augmented[0][0].numpy()))
 
-    def test_per_record_configs_are_resolved(self) -> None:
+    def test_custom_augment_config_is_honoured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             record = self._record(directory)
             light = augmentation_config("light")
@@ -369,8 +354,7 @@ class SignatureDatasetAugmentationTests(unittest.TestCase):
                 already_preprocessed=True,
                 augment=True,
                 augment_seed=5,
-                record_datasets=["CEDAR"],
-                dataset_configs={"CEDAR": light},
+                augment_config=light,
             )
             expected = augment_signature(
                 load_preprocessed_image(record.image_path, already_preprocessed=True),
@@ -378,11 +362,3 @@ class SignatureDatasetAugmentationTests(unittest.TestCase):
                 np.random.default_rng([5, 0, 0]),
             )
             np.testing.assert_allclose(dataset[0][0].numpy(), to_model_input(expected))
-
-    def test_record_datasets_must_align_with_records(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            record = self._record(directory)
-            with self.assertRaisesRegex(ValueError, "one label per record"):
-                SignatureDataset(
-                    [record], {"a": 0}, already_preprocessed=True, record_datasets=["a", "b"]
-                )

@@ -19,7 +19,7 @@ the vector is meaningful as a single handcrafted score.
 
 Images must be the same kind of input the CNN consumes: the ``uint8`` grayscale output
 of :func:`preprocessing.signature_preprocessing.preprocess_signature`, or an already
-preprocessed ``256 x 512`` grayscale file. Use :func:`describe_records` to read
+preprocessed Stage 2.2 grayscale file. Use :func:`describe_records` to read
 manifest rows through the same loader the training dataset uses, which is what keeps
 handcrafted features and deep embeddings free of train/serve skew.
 """
@@ -399,7 +399,7 @@ def describe_records(
 
     Args:
         records: Manifest records exposing an ``image_path`` attribute.
-        already_preprocessed: Read files as ``256 x 512`` grayscale instead of running
+        already_preprocessed: Read files as Stage 2.2 grayscale instead of running
             Stage 2.2 preprocessing.
         ink: Retained for preprocessing compatibility; ignored by Stage 2.2.
         threshold: Fixed ink cut forwarded to :func:`describe_image`.

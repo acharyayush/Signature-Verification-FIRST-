@@ -31,7 +31,7 @@ cheque signature and one or more stored reference signatures.
 | --- | --- | --- |
 | 1. Signature extraction | Detect and crop the signature from the cheque (e.g. YOLO). | Upstream, outside this repo |
 | 2.1 Artifact cleaning | Remove stamps, printed lines, and noise from the crop. | Upstream, outside this repo |
-| 2.2 Image preprocessing | Grayscale normalization, tight ink crop, aspect-aware resize to `512 × 256`. | Implemented in [`preprocessing/`](./preprocessing) |
+| 2.2 Image preprocessing | Grayscale normalization, tight ink crop, aspect-aware resize to `384 × 192`. | Implemented in [`preprocessing/`](./preprocessing) |
 | 3. Deep metric learning | Train a ConvNeXt-Tiny Siamese encoder that outputs L2-normalized 512-D embeddings. | Implemented in [`training/`](./training) |
 | 4. Scoring & verification | Compare embeddings with cosine similarity; optionally fuse handcrafted geometric features; evaluate FAR / FRR / EER. | Implemented in [`training/evaluate.py`](./training/evaluate.py) and [`scoring/`](./scoring) |
 
@@ -54,7 +54,7 @@ Signature-Verification/
 │   ├── signature_preprocessing.py   Stage 2.2: grayscale normalize + aspect-aware resize
 │   ├── augmentation.py              Training-only augmentation (tilt, pen width, warp, photometric)
 │   ├── build_manifests.py           Build the BHSig260 manifest and merge per-dataset manifests
-│   ├── preprocess_dataset.py        One-time: raw dataset -> 256x512 PNGs + processed manifest
+│   ├── preprocess_dataset.py        One-time: raw dataset -> 192x384 PNGs + processed manifest
 │   └── demo_outputs.py              Demo: preprocess the sample JPEGs
 ├── training/
 │   ├── stage3_metric_learning.py    Model, dataset, PK batch sampler, triplet loss
@@ -76,9 +76,9 @@ Signature-Verification/
    (dark ink on white, keeping grayscale stroke intensity), forces the estimated paper
    background to pure white while leaving every ink pixel byte-for-byte unchanged,
    crops tightly to the ink with a small margin, and resizes without
-   stretching onto a `512 × 256` white canvas. `to_model_input` then replicates the
+   stretching onto a `384 × 192` white canvas. `to_model_input` then replicates the
    single channel to 3 channels and applies ImageNet normalization, producing the
-   `3 × 256 × 512` tensor the model expects. Empty crops raise `ValueError` so they can
+   `3 × 192 × 384` tensor the model expects. Empty crops raise `ValueError` so they can
    be routed to human review.
 2. **Train (stage 3).** `python -m training.train_siamese` reads a signer-disjoint CSV
    manifest and trains the encoder in two phases: first the ConvNeXt backbone is frozen
@@ -180,7 +180,7 @@ By default, images are read as Stage 2.1 outputs and passed through
 preserves the signature's true grayscale stroke intensity so pressure and ink flow
 are not lost: `whiten_background` forces the estimated paper background to pure
 white while returning every ink pixel **unchanged** (it does not rescale ink by the
-local background). For already preprocessed 256x512
+local background). For already preprocessed 192x384
 grayscale images, pass `--already-preprocessed`. The preprocessing assumes dark
 signatures on a white or whitish background. The legacy `--ink` option remains
 accepted for compatibility but is ignored. Pass `background_mode="flatten"` to
@@ -188,13 +188,13 @@ accepted for compatibility but is ignored. Pass `background_mode="flatten"` to
 ablation only).
 
 Training can be augmented with `--augment` (and `--augment-strength light|standard|strong`).
-Augmentation applies to the **training split only** and includes rotation (up to 20° for
-`standard`, simulating a tilted cheque signature), shear, a mild perspective, elastic
-warping, pen stroke width, ink contrast (gamma is off: it duplicates ink contrast), blur, and noise. Each augmented image is
-re-whitened and re-fitted through the same crop + resize as inference, so the
-representation contract is unchanged. BHSig260 (Indic script) automatically receives a
-milder elastic warp, because deforming connected strokes destroys the structure that
-discriminates writers.
+Augmentation applies to the **training split only** and is limited to four transforms, one
+per real-world cause of variation: rotation (up to 20° for `standard` -- the cheque tilt),
+pen stroke width, ink contrast (pen pressure) and blur (scan quality). Shear, perspective,
+elastic warping, gamma and noise were removed: gamma duplicated ink contrast, and the
+others added variation these datasets do not exhibit. Each augmented image is re-whitened
+and re-fitted through the same crop + resize as inference, so the representation contract
+is unchanged.
 
 ### Train
 
@@ -222,7 +222,7 @@ python -m unittest discover -s tests -t .
 
 The deep cosine score alone is already a strong baseline. On skilled forgeries it can
 still be improved by fusing in cheap, interpretable handcrafted evidence computed from
-the same preprocessed `512 × 256` grayscale image. The fusion module lives in
+the same preprocessed `384 × 192` grayscale image. The fusion module lives in
 [`scoring/`](./scoring) and is entirely optional: without `--fusion-config` the deep
 baseline numbers are unchanged.
 
