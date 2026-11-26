@@ -9,5 +9,14 @@ checkpoints/
 *.pth
 # Generated demo output (160+ PNGs): rebuild with `python -m preprocessing.demo_augmentations`.
 augmentation_samples/
-# 69 MB generated benchmark (~450 images): rebuild with `python -m scripts.build_ultimate_test_signs`.
+# Generated benchmarks (~450 Stage 2.2 384x192 PNGs each): rebuild with
+# `python -m scripts.build_ultimate_test_signs` (grayscale) or
+# `python -m scripts.build_ultimate_test_signs --binarize --output "Ultimate Test Signs Binarized"`.
 Ultimate Test Signs/
+Ultimate Test Signs Binarized/
+*streamlit*/
+*streamlit*
+*Streamlit*/
+*kaggle*/
+ultimate_report_site.zip
+ultimate_report_site/

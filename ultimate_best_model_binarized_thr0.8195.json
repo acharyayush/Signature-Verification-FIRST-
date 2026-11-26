@@ -1,0 +1,72 @@
+{
+  "checkpoint": "/Users/aacs/Desktop/Sign Verification Main/Signature-Verification/ultimate_best_model.pt",
+  "manifest": "/Users/aacs/Desktop/Sign Verification Main/Signature-Verification/Ultimate Test Signs Binarized/manifest_ultimate.csv",
+  "device": "cpu",
+  "threshold": 0.8195,
+  "threshold_source": "fixed",
+  "pairs": {
+    "genuine": 150,
+    "skilled": 150,
+    "random": 150,
+    "per_signer": 9
+  },
+  "overall": {
+    "threshold": 0.8195,
+    "tp": 137,
+    "fp": 33,
+    "tn": 267,
+    "fn": 13,
+    "far": 0.11,
+    "frr": 0.08666666666666667,
+    "accuracy": 0.8977777777777778,
+    "far_skilled": 0.15333333333333332,
+    "far_random": 0.06666666666666667,
+    "eer_skilled": 0.11333333333333333,
+    "eer_random": 0.07333333333333333,
+    "eer_combined": 0.09333333333333334
+  },
+  "per_dataset": {
+    "bhsig260": {
+      "threshold": 0.8195,
+      "tp": 69,
+      "fp": 13,
+      "tn": 137,
+      "fn": 6,
+      "far": 0.08666666666666667,
+      "frr": 0.08,
+      "accuracy": 0.9155555555555556,
+      "far_skilled": 0.09333333333333334,
+      "eer_skilled": 0.08,
+      "far_random": 0.08,
+      "eer_random": 0.08
+    },
+    "cedar": {
+      "threshold": 0.8195,
+      "tp": 22,
+      "fp": 1,
+      "tn": 47,
+      "fn": 2,
+      "far": 0.020833333333333332,
+      "frr": 0.08333333333333333,
+      "accuracy": 0.9583333333333334,
+      "far_skilled": 0.041666666666666664,
+      "eer_skilled": 0.041666666666666664,
+      "far_random": 0.0,
+      "eer_random": 0.0
+    },
+    "sigresize": {
+      "threshold": 0.8195,
+      "tp": 46,
+      "fp": 19,
+      "tn": 83,
+      "fn": 5,
+      "far": 0.18627450980392157,
+      "frr": 0.09803921568627451,
+      "accuracy": 0.8431372549019608,
+      "far_skilled": 0.29411764705882354,
+      "eer_skilled": 0.1568627450980392,
+      "far_random": 0.0784313725490196,
+      "eer_random": 0.0784313725490196
+    }
+  }
+}

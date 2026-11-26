@@ -1,41 +1,61 @@
 """Evaluate the "Ultimate Test Signs" benchmark: FAR / FRR and a confusion matrix.
 
 The benchmark is built by :mod:`scripts.build_ultimate_test_signs` and described by
-``Ultimate Test Signs/manifest_ultimate.csv``. Every signer folder holds three genuine
-signatures, three skilled forgeries of that signer, and three genuine signatures of a
-*different* signer of the same dataset::
+``Ultimate Test Signs/manifest_ultimate.csv``. The builder stores Stage 2.2 preprocessed
+``384 x 192`` grayscale PNGs, and evaluation reads them as they are: this script does no
+preprocessing, so the images must already be preprocessed (the builder guarantees it).
+Every signer folder holds three genuine signatures, three skilled forgeries of that
+signer, and three genuine signatures of a *different* signer of the same dataset::
 
-    Signer_001/Genuine/  3 genuine signatures   -> references + genuine queries (positives)
-    Signer_001/Forged/   3 skilled forgeries    -> skilled impostors          (negatives)
-    Signer_001/Random/   3 other-signer genuine -> random impostors           (negatives)
+    Signer_001/Genuine/  3 genuine signatures   -> positive pairs
+    Signer_001/Forged/   3 skilled forgeries    -> skilled impostor pairs (negatives)
+    Signer_001/Random/   3 other-signer genuine -> random impostor pairs  (negatives)
 
-Protocol (identical to :mod:`training.evaluate`): the first ``--references`` genuine
-signatures of every signer are enrolled as references, and a query is scored by its mean
-cosine similarity to those references. A query is accepted when ``score >= threshold``,
-because a higher score means "more likely the same signer". Genuine queries are the
-positives and both impostor kinds are negatives::
+Protocol (pairwise). There is no enrolment and no averaging over references: every
+comparison is a single pair, scored by the cosine similarity of its two embeddings. A
+signer with three genuine, three skilled, and three random signatures contributes nine
+pairs::
 
-    true positives   (TP): genuine query accepted
-    false negatives  (FN): genuine query rejected
-    true negatives   (TN): impostor query rejected
-    false positives  (FP): impostor query accepted
+    genuine: every unordered pair of the genuine signatures     -> C(3, 2) = 3 pairs
+    skilled: the i-th genuine against the i-th skilled forgery  -> 3 pairs
+    random:  the i-th genuine against the i-th random impostor  -> 3 pairs
+
+Both impostor folders are sorted by file name and paired positionally with the sorted
+genuine signatures, so the pairing is deterministic and every genuine signature takes part.
+Genuine pairs are the positives and both impostor kinds are the negatives. A pair is
+accepted when ``score >= threshold``, because a higher score means "more likely the same
+signer"::
+
+    true positives   (TP): genuine pair accepted
+    false negatives  (FN): genuine pair rejected
+    true negatives   (TN): impostor pair rejected
+    false positives  (FP): impostor pair accepted
 
 with ``FAR = FP / (FP + TN)`` and ``FRR = FN / (FN + TP)``. Skilled-forgery and random FAR
 are also reported separately, because a learned forgery and an unrelated signer are very
 different threats.
 
-Operating point: by default the equal-error threshold of this benchmark is used and the
-report labels it ``test_eer`` -- the Ultimate set is a *test* set, so nothing here is tuned
-on it. Pass ``--threshold`` to apply a fixed, externally calibrated threshold (for example
-the deep threshold :mod:`training.evaluate` derived on the validation signers), or
-``--target-far`` to take the largest threshold whose combined-impostor FAR meets a budget.
+Operating point: by default a fixed threshold of ``0.823`` is applied
+(:data:`DEFAULT_THRESHOLD`, a temporary stand-in for a calibrated value). Pass
+``--threshold`` to apply a different fixed cut (for example the deep threshold
+:mod:`training.evaluate` derived on the validation signers), or ``--target-far`` to take the
+largest threshold whose combined-impostor FAR meets a budget.
+
+Score-level fusion (optional). With ``--fusion-config`` every pair is also scored by the
+fused rule from :mod:`scoring.fusion` (the deep cosine plus the nine handcrafted features)
+and a ``fusion`` block with its own FAR / FRR / EER is added next to the deep baseline, both
+pooled and per dataset. The fused operating point is taken from ``--fused-threshold``, then
+the threshold the fitter stored in the config, then ``--threshold``, then
+:data:`DEFAULT_THRESHOLD`; the deep threshold is never silently reused unless nothing else is
+available, because the two live in different score spaces.
 
 Usage:
     python -m training.evaluate_ultimate \\
         --checkpoint best_model_first.pt \\
-        --manifest "Ultimate Test Signs/manifest_ultimate.csv" --references 2
-    python -m training.evaluate_ultimate ... --target-far 0.03 \\
+        --manifest "Ultimate Test Signs/manifest_ultimate.csv"
+    python -m training.evaluate_ultimate ... --threshold 0.823 \\
         --report ultimate_report.json
+    python -m training.evaluate_ultimate ... --fusion-config fusion.json
 """
 
 from __future__ import annotations
@@ -49,6 +69,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from scoring.fusion import (
+    HAND_NORMALIZATION_KEY,
+    FusionScorer,
+    HandNormalizer,
+    load_fusion_config,
+)
+from scoring.handcrafted_features import describe_records, pair_features
 from scoring.metrics import eer_threshold, rates_at_threshold, threshold_at_far
 from training.stage3_metric_learning import (
     SiameseSignatureModel,
@@ -114,10 +141,10 @@ def build_records(
 ) -> tuple[list[SignatureRecord], dict[str, list[int]]]:
     """Turn manifest rows into records plus a ``folder -> row indices`` grouping.
 
-    ``signer_id`` is the signer *folder* the row lives in, so a query is scored against
-    the references of the signer it is meant to match. ``is_forgery`` is only set for the
-    explicit forgeries; the genuine/forged/random distinction needed for the confusion
-    matrix is carried by the row itself, not by this record flag.
+    ``signer_id`` is the signer *folder* the row lives in, so every pair is scored within the
+    signer folder it belongs to. ``is_forgery`` is only set for the explicit forgeries; the
+    genuine/forged/random distinction needed for the confusion matrix is carried by the row
+    itself, not by this record flag.
     """
     records: list[SignatureRecord] = []
     by_folder: dict[str, list[int]] = defaultdict(list)
@@ -137,68 +164,144 @@ def build_records(
 GENUINE = "genuine"
 FORGED = "forged"
 RANDOM = "random"
+# Temporary fixed operating point used when neither ``--threshold`` nor ``--target-far`` is
+# given. 0.823 is a stand-in for a calibrated value; restore the equal-error default once
+# the real threshold is available.
+DEFAULT_THRESHOLD = 0.823
 _REQUIRED_COLUMNS = {"folder", "class", "source_dataset", "source_signer", "image_path"}
 
 
-def reference_indices(
+def _folder_signatures(
+    rows: list[dict[str, str]],
+    indices: list[int],
+    kind: str,
+) -> list[int]:
+    """Return the folder's ``kind`` rows, ordered by file name for a deterministic pairing."""
+    return sorted(
+        (index for index in indices if rows[index]["class"] == kind),
+        key=lambda index: rows[index]["image_path"],
+    )
+
+
+def pair_indices(
     rows: list[dict[str, str]],
     by_folder: dict[str, list[int]],
-    references: int,
-) -> dict[str, list[int]]:
-    """Return the first ``references`` genuine images enrolled per signer folder.
+) -> dict[str, list[tuple[int, int]]]:
+    """Build the comparison pairs every signer contributes, grouped by pair kind.
 
-    Ordered by file name so the enrolment is deterministic.
+    Per folder, with the genuine/forged/random signatures each ordered by file name:
+
+    * ``genuine``: every unordered pair of the genuine signatures, ``C(n, 2)`` pairs.
+    * ``skilled``: the ``i``-th genuine against the ``i``-th skilled forgery.
+    * ``random``:  the ``i``-th genuine against the ``i``-th random impostor.
+
+    A folder holding three of each class therefore yields ``3 + 3 + 3 = 9`` pairs, which is
+    the protocol the benchmark is built around. Every pair takes part, so nothing is dropped
+    silently.
 
     Raises:
-        ValueError: If a signer has too few genuine signatures to enrol ``references`` and
-            still keep at least one genuine query.
+        ValueError: If a folder has fewer than two genuine signatures, or its forged/random
+            counts differ from its genuine count (the positional pairing would drop pairs).
     """
-    enrolled: dict[str, list[int]] = {}
+    pairs: dict[str, list[tuple[int, int]]] = {GENUINE: [], "skilled": [], RANDOM: []}
     for folder, indices in by_folder.items():
-        genuine = sorted(
-            (index for index in indices if rows[index]["class"] == GENUINE),
-            key=lambda index: rows[index]["image_path"],
-        )
-        if len(genuine) <= references:
+        genuine = _folder_signatures(rows, indices, GENUINE)
+        if len(genuine) < 2:
             raise ValueError(
-                f"{folder} has {len(genuine)} genuine signatures; more than {references} "
-                "are needed to enrol references and keep a genuine query"
+                f"{folder} has {len(genuine)} genuine signatures; at least two are needed "
+                "for a genuine pair"
             )
-        enrolled[folder] = genuine[:references]
-    return enrolled
+        for first in range(len(genuine)):
+            for second in range(first + 1, len(genuine)):
+                pairs[GENUINE].append((genuine[first], genuine[second]))
+        for kind, impostor_class in (("skilled", FORGED), (RANDOM, RANDOM)):
+            impostors = _folder_signatures(rows, indices, impostor_class)
+            if len(impostors) != len(genuine):
+                raise ValueError(
+                    f"{folder} has {len(genuine)} genuine but {len(impostors)} {kind} "
+                    "signatures; the positional pairing needs equal counts"
+                )
+            pairs[kind].extend(
+                (genuine[position], impostors[position]) for position in range(len(genuine))
+            )
+    return pairs
 
 
-def iter_query_scores(
+def iter_pair_scores(
     embeddings: np.ndarray,
     rows: list[dict[str, str]],
-    enrolled: dict[str, list[int]],
+    pairs: dict[str, list[tuple[int, int]]],
 ):
-    """Yield ``(row_index, query_kind, score)`` for every non-reference query.
+    """Yield ``(row_index, pair_kind, score)`` for every comparison pair.
 
-    A query's score is its mean cosine similarity to its signer's references, the same
-    aggregation :mod:`training.evaluate` uses. Embeddings are L2-normalised, so their dot
-    product is the cosine similarity. ``query_kind`` is ``genuine``, ``skilled``, or
-    ``random``.
+    ``row_index`` is the first (genuine) row of the pair, so a caller can attribute the pair
+    to that row's ``source_dataset``. Embeddings are L2-normalised, so their dot product is
+    the cosine similarity. ``pair_kind`` is ``genuine``, ``skilled``, or ``random``.
     """
-    for index, row in enumerate(rows):
-        kind = row["class"]
-        refs = enrolled[row["folder"]]
-        if kind == GENUINE and index in refs:
-            continue  # an enrolled reference is not a query
-        similarity = embeddings[refs] @ embeddings[index]
-        yield index, ("skilled" if kind == FORGED else kind), float(similarity.mean())
+    for kind, index_pairs in pairs.items():
+        for first, second in index_pairs:
+            yield first, kind, float(embeddings[first] @ embeddings[second])
 
 
-def score_queries(
+def score_pairs(
     embeddings: np.ndarray,
     rows: list[dict[str, str]],
-    enrolled: dict[str, list[int]],
+    pairs: dict[str, list[tuple[int, int]]],
 ) -> dict[str, list[float]]:
-    """Collect :func:`iter_query_scores` into one score list per query kind."""
+    """Collect :func:`iter_pair_scores` into one score list per pair kind."""
     scores: dict[str, list[float]] = {GENUINE: [], "skilled": [], RANDOM: []}
-    for _, query_kind, score in iter_query_scores(embeddings, rows, enrolled):
-        scores[query_kind].append(score)
+    for _, pair_kind, score in iter_pair_scores(embeddings, rows, pairs):
+        scores[pair_kind].append(score)
     return scores
+
+
+def iter_fused_pair_scores(
+    embeddings: np.ndarray,
+    rows: list[dict[str, str]],
+    pairs: dict[str, list[tuple[int, int]]],
+    descriptors: list,
+    scorer: FusionScorer,
+    hand_normalizer: HandNormalizer | None = None,
+):
+    """Yield ``(first, second, pair_kind, fused_score)`` for every comparison pair.
+
+    Mirrors :func:`iter_pair_scores` but replaces the cosine score with the fused rule from
+    :mod:`scoring.fusion`: the pair's nine handcrafted features are combined with its deep
+    cosine score. When a ``hand_normalizer`` is present the features are standardised with
+    the *query* row's dataset, exactly as :func:`scoring.fusion.score_queries` does, so the
+    fused score is computed in the space the config was fitted in.
+    """
+    for kind, index_pairs in pairs.items():
+        for first, second in index_pairs:
+            deep = float(embeddings[first] @ embeddings[second])
+            features = pair_features(descriptors[first], descriptors[second])
+            if hand_normalizer is not None:
+                features = hand_normalizer.transform_features(
+                    features, rows[second]["source_dataset"]
+                )
+            yield first, second, kind, float(scorer.score(deep, features))
+
+
+def fusion_decision_threshold(
+    *,
+    fused_threshold: float | None,
+    config_threshold: float | None,
+    deep_threshold: float | None,
+) -> tuple[float, str]:
+    """Pick the fused operating point and return ``(threshold, source)``.
+
+    Precedence: an explicit ``--fused-threshold``, then the threshold the fitter stored in
+    the config, then an explicit ``--threshold``, then the temporary fixed
+    :data:`DEFAULT_THRESHOLD`. The fused score lives in a different space from the deep
+    cosine, so a threshold is only borrowed across the two when nothing else is available.
+    """
+    if fused_threshold is not None:
+        return float(fused_threshold), "fused_threshold"
+    if config_threshold is not None:
+        return float(config_threshold), "fusion_config"
+    if deep_threshold is not None:
+        return float(deep_threshold), "threshold"
+    return DEFAULT_THRESHOLD, "default"
 
 
 def confusion(
@@ -242,17 +345,16 @@ def _decision_threshold(
 ) -> tuple[float, str, float | None]:
     """Pick the operating point and return ``(threshold, source, achieved_far)``.
 
-    Precedence mirrors :mod:`training.evaluate`: an explicit ``--threshold`` wins, then a
-    ``--target-far`` budget on the combined impostors, then the benchmark's own equal-error
-    threshold. ``achieved_far`` is only filled for the target-FAR branch.
+    Precedence: an explicit ``--threshold`` wins, then a ``--target-far`` budget on the
+    combined impostors, then the temporary fixed :data:`DEFAULT_THRESHOLD`. ``achieved_far``
+    is only filled for the target-FAR branch.
     """
     if fixed is not None:
         return float(fixed), "fixed", None
     if target_far is not None:
         threshold, achieved_far = threshold_at_far(negatives, target_far)
         return float(threshold), "target_far", achieved_far
-    threshold = float(eer_threshold(genuine, negatives)[0])
-    return threshold, "test_eer", None
+    return DEFAULT_THRESHOLD, "default", None
 
 
 def main() -> None:
@@ -260,20 +362,6 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--image-root", type=Path)
-    parser.add_argument(
-        "--already-preprocessed",
-        action="store_true",
-        help=(
-            "Treat the manifest images as Stage 2.2 grayscale files (default 384x192) "
-            "instead of raw crops."
-        ),
-    )
-    parser.add_argument(
-        "--references",
-        type=int,
-        default=2,
-        help="Genuine signatures enrolled per signer (the manifest ships three).",
-    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--workers", type=int, default=0)
@@ -281,7 +369,7 @@ def main() -> None:
         "--threshold",
         type=float,
         default=None,
-        help="Apply this fixed score threshold instead of deriving one from the benchmark.",
+        help="Apply this fixed score threshold instead of the temporary default 0.823.",
     )
     parser.add_argument(
         "--target-far",
@@ -292,16 +380,35 @@ def main() -> None:
             "this value, which also minimises FRR subject to the budget."
         ),
     )
+    parser.add_argument(
+        "--fusion-config",
+        type=Path,
+        help="Fusion config written by training.fit_fusion; adds a fused score block.",
+    )
+    parser.add_argument(
+        "--fused-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Fixed decision threshold for the fused score. Default: the threshold stored "
+            "in the fusion config, then --threshold, then 0.823."
+        ),
+    )
+    parser.add_argument(
+        "--fusion-report",
+        type=Path,
+        help="Optional path to also write the full JSON report (deep + fusion) to disk.",
+    )
     parser.add_argument("--report", type=Path, help="Also write the JSON report here.")
     args = parser.parse_args()
-    if args.references < 1:
-        raise ValueError("--references must be at least 1")
     if args.target_far is not None and not 0.0 <= args.target_far <= 1.0:
         raise ValueError("--target-far must be in [0, 1]")
     if args.threshold is not None and not 0.0 <= args.threshold <= 1.0:
         raise ValueError("--threshold must be in [0, 1]")
     if args.threshold is not None and args.target_far is not None:
         raise ValueError("--threshold and --target-far are mutually exclusive")
+    if args.fused_threshold is not None and not 0.0 <= args.fused_threshold <= 1.0:
+        raise ValueError("--fused-threshold must be in [0, 1]")
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     model = SiameseSignatureModel(
@@ -310,27 +417,66 @@ def main() -> None:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(args.device)
 
+    scorer: FusionScorer | None = None
+    fusion_config = None
+    hand_normalizer: HandNormalizer | None = None
+    if args.fusion_config is not None:
+        fusion_config = load_fusion_config(args.fusion_config)
+        scorer = FusionScorer(fusion_config)
+        hand_normalizer = HandNormalizer.from_metadata(
+            fusion_config.metadata.get(HAND_NORMALIZATION_KEY)
+        )
+        fitted_checkpoint = fusion_config.metadata.get("checkpoint")
+        if fitted_checkpoint and Path(str(fitted_checkpoint)).name != Path(
+            args.checkpoint
+        ).name:
+            print(
+                "warning: the fusion config was fitted for a different checkpoint "
+                f"({Path(str(fitted_checkpoint)).name}); the fused weights are applied "
+                "as-is and may not transfer"
+            )
+
     rows = read_ultimate_manifest(args.manifest, args.image_root)
     records, by_folder = build_records(rows)
+    pairs = pair_indices(rows, by_folder)
+    pair_count = sum(len(group) for group in pairs.values())
     print(
-        f"{len(records)} images from {len(by_folder)} signers; embedding on {args.device} "
-        f"(already_preprocessed={args.already_preprocessed})"
+        f"{len(records)} images from {len(by_folder)} signers; {pair_count} comparison "
+        f"pairs ({pair_count // len(by_folder)} per signer); embedding on {args.device} "
+        "(preprocessed images; no preprocessing applied)"
     )
     embeddings = embed_records(
         model,
         records,
-        already_preprocessed=args.already_preprocessed,
+        already_preprocessed=True,
         device=args.device,
         batch_size=args.batch_size,
         workers=args.workers,
     )
 
-    enrolled = reference_indices(rows, by_folder, args.references)
-    scores = score_queries(embeddings, rows, enrolled)
+    scores = score_pairs(embeddings, rows, pairs)
     genuine = np.asarray(scores[GENUINE], dtype=np.float64)
     skilled = np.asarray(scores["skilled"], dtype=np.float64)
     random_scores = np.asarray(scores[RANDOM], dtype=np.float64)
     negatives = np.concatenate([skilled, random_scores])
+
+    fused_pair_list: list[tuple[int, int, str, float]] = []
+    fused_genuine: np.ndarray | None = None
+    fused_skilled: np.ndarray | None = None
+    fused_random: np.ndarray | None = None
+    if scorer is not None:
+        descriptors = describe_records(records, already_preprocessed=True)
+        fused_pair_list = list(
+            iter_fused_pair_scores(
+                embeddings, rows, pairs, descriptors, scorer, hand_normalizer
+            )
+        )
+        fused_by_kind: dict[str, list[float]] = {GENUINE: [], "skilled": [], RANDOM: []}
+        for _, _, pair_kind, score in fused_pair_list:
+            fused_by_kind[pair_kind].append(score)
+        fused_genuine = np.asarray(fused_by_kind[GENUINE], dtype=np.float64)
+        fused_skilled = np.asarray(fused_by_kind["skilled"], dtype=np.float64)
+        fused_random = np.asarray(fused_by_kind[RANDOM], dtype=np.float64)
 
     threshold, threshold_source, achieved_far = _decision_threshold(
         genuine, negatives, fixed=args.threshold, target_far=args.target_far
@@ -345,15 +491,14 @@ def main() -> None:
     report: dict[str, object] = {
         "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
         "manifest": str(Path(args.manifest).expanduser().resolve()),
-        "references": args.references,
-        "already_preprocessed": bool(args.already_preprocessed),
         "device": str(args.device),
         "threshold": threshold,
         "threshold_source": threshold_source,
-        "queries": {
+        "pairs": {
             "genuine": int(genuine.size),
             "skilled": int(skilled.size),
             "random": int(random_scores.size),
+            "per_signer": pair_count // len(by_folder),
         },
         "overall": overall,
     }
@@ -361,13 +506,42 @@ def main() -> None:
         report["target_far"] = args.target_far
         report["target_far_achieved"] = achieved_far
 
+    fused_threshold_value: float | None = None
+    if scorer is not None and fusion_config is not None:
+        fused_threshold_value, fused_threshold_source = fusion_decision_threshold(
+            fused_threshold=args.fused_threshold,
+            config_threshold=fusion_config.threshold,
+            deep_threshold=args.threshold,
+        )
+        fused_negatives = np.concatenate([fused_skilled, fused_random])
+        fused_overall = confusion(fused_genuine, fused_negatives, fused_threshold_value)
+        fused_overall["far_skilled"] = rates_at_threshold(
+            fused_genuine, fused_skilled, fused_threshold_value
+        )[0]
+        fused_overall["far_random"] = rates_at_threshold(
+            fused_genuine, fused_random, fused_threshold_value
+        )[0]
+        fused_overall["eer_skilled"] = eer_threshold(fused_genuine, fused_skilled)[1]
+        fused_overall["eer_random"] = eer_threshold(fused_genuine, fused_random)[1]
+        fused_overall["eer_combined"] = eer_threshold(fused_genuine, fused_negatives)[1]
+        report["fusion"] = {
+            "config": str(Path(args.fusion_config).expanduser().resolve()),
+            "type": fusion_config.type,
+            "features": list(fusion_config.features),
+            "dropped_features": list(fusion_config.dropped_features),
+            "hand_normalized": hand_normalizer is not None,
+            "threshold": fused_threshold_value,
+            "threshold_source": fused_threshold_source,
+            "overall": fused_overall,
+        }
+
     # Per-dataset breakdown: the same operating point on each source dataset, so a
     # regression in one script cannot hide behind another dataset in the pooled number.
     by_dataset: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: {GENUINE: [], "skilled": [], RANDOM: []}
     )
-    for index, query_kind, score in iter_query_scores(embeddings, rows, enrolled):
-        by_dataset[rows[index]["source_dataset"]][query_kind].append(score)
+    for index, pair_kind, score in iter_pair_scores(embeddings, rows, pairs):
+        by_dataset[rows[index]["source_dataset"]][pair_kind].append(score)
 
     datasets: dict[str, object] = {}
     for name in sorted(by_dataset):
@@ -393,10 +567,50 @@ def main() -> None:
         datasets[name] = block
     report["per_dataset"] = datasets
 
+    # The same fused operating point on each source dataset, next to the deep block.
+    if scorer is not None and fused_threshold_value is not None:
+        fused_by_dataset: dict[str, dict[str, list[float]]] = defaultdict(
+            lambda: {GENUINE: [], "skilled": [], RANDOM: []}
+        )
+        for index, _, pair_kind, score in fused_pair_list:
+            fused_by_dataset[rows[index]["source_dataset"]][pair_kind].append(score)
+        for name in sorted(datasets):
+            block = datasets[name]
+            buckets = fused_by_dataset.get(name)
+            if not buckets:
+                continue
+            dataset_genuine = np.asarray(buckets[GENUINE], dtype=np.float64)
+            dataset_skilled = np.asarray(buckets["skilled"], dtype=np.float64)
+            dataset_random = np.asarray(buckets[RANDOM], dtype=np.float64)
+            fused_block = confusion(
+                dataset_genuine,
+                np.concatenate([dataset_skilled, dataset_random]),
+                fused_threshold_value,
+            )
+            if dataset_skilled.size:
+                fused_block["far_skilled"] = rates_at_threshold(
+                    dataset_genuine, dataset_skilled, fused_threshold_value
+                )[0]
+                fused_block["eer_skilled"] = eer_threshold(
+                    dataset_genuine, dataset_skilled
+                )[1]
+            if dataset_random.size:
+                fused_block["far_random"] = rates_at_threshold(
+                    dataset_genuine, dataset_random, fused_threshold_value
+                )[0]
+                fused_block["eer_random"] = eer_threshold(
+                    dataset_genuine, dataset_random
+                )[1]
+            block["fusion"] = fused_block  # type: ignore[index]
+
     text = json.dumps(report, indent=2)
     print(text)
     if args.report is not None:
         destination = Path(args.report).expanduser().resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(text + "\n", encoding="utf-8")
+    if args.fusion_report is not None:
+        destination = Path(args.fusion_report).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(text + "\n", encoding="utf-8")
 

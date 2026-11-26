@@ -1,0 +1,72 @@
+{
+  "checkpoint": "/Users/aacs/Desktop/Sign Verification Main/Signature-Verification/best_model_grayscale_4.pt",
+  "manifest": "/Users/aacs/Desktop/Sign Verification Main/Signature-Verification/Ultimate Test Signs/manifest_ultimate.csv",
+  "device": "cpu",
+  "threshold": 0.8578785764039285,
+  "threshold_source": "fixed",
+  "pairs": {
+    "genuine": 150,
+    "skilled": 150,
+    "random": 150,
+    "per_signer": 9
+  },
+  "overall": {
+    "threshold": 0.8578785764039285,
+    "tp": 126,
+    "fp": 24,
+    "tn": 276,
+    "fn": 24,
+    "far": 0.08,
+    "frr": 0.16,
+    "accuracy": 0.8933333333333333,
+    "far_skilled": 0.12666666666666668,
+    "far_random": 0.03333333333333333,
+    "eer_skilled": 0.13333333333333333,
+    "eer_random": 0.07333333333333333,
+    "eer_combined": 0.1
+  },
+  "per_dataset": {
+    "bhsig260": {
+      "threshold": 0.8578785764039285,
+      "tp": 61,
+      "fp": 9,
+      "tn": 141,
+      "fn": 14,
+      "far": 0.06,
+      "frr": 0.18666666666666668,
+      "accuracy": 0.8977777777777778,
+      "far_skilled": 0.09333333333333334,
+      "eer_skilled": 0.14666666666666667,
+      "far_random": 0.02666666666666667,
+      "eer_random": 0.04
+    },
+    "cedar": {
+      "threshold": 0.8578785764039285,
+      "tp": 22,
+      "fp": 5,
+      "tn": 43,
+      "fn": 2,
+      "far": 0.10416666666666667,
+      "frr": 0.08333333333333333,
+      "accuracy": 0.9027777777777778,
+      "far_skilled": 0.16666666666666666,
+      "eer_skilled": 0.16666666666666666,
+      "far_random": 0.041666666666666664,
+      "eer_random": 0.041666666666666664
+    },
+    "sigresize": {
+      "threshold": 0.8578785764039285,
+      "tp": 43,
+      "fp": 10,
+      "tn": 92,
+      "fn": 8,
+      "far": 0.09803921568627451,
+      "frr": 0.1568627450980392,
+      "accuracy": 0.8823529411764706,
+      "far_skilled": 0.1568627450980392,
+      "eer_skilled": 0.1568627450980392,
+      "far_random": 0.0392156862745098,
+      "eer_random": 0.058823529411764705
+    }
+  }
+}

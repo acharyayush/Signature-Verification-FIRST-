@@ -1,0 +1,72 @@
+{
+  "checkpoint": "/Users/aacs/Desktop/Sign Verification Main/Signature-Verification/best_model_grayscale_4.pt",
+  "manifest": "/Users/aacs/Desktop/Sign Verification Main/Signature-Verification/Ultimate Test Signs Binarized/manifest_ultimate.csv",
+  "device": "cpu",
+  "threshold": 0.8578785764039285,
+  "threshold_source": "fixed",
+  "pairs": {
+    "genuine": 150,
+    "skilled": 150,
+    "random": 150,
+    "per_signer": 9
+  },
+  "overall": {
+    "threshold": 0.8578785764039285,
+    "tp": 134,
+    "fp": 40,
+    "tn": 260,
+    "fn": 16,
+    "far": 0.13333333333333333,
+    "frr": 0.10666666666666667,
+    "accuracy": 0.8755555555555555,
+    "far_skilled": 0.22666666666666666,
+    "far_random": 0.04,
+    "eer_skilled": 0.17333333333333334,
+    "eer_random": 0.06666666666666667,
+    "eer_combined": 0.12666666666666668
+  },
+  "per_dataset": {
+    "bhsig260": {
+      "threshold": 0.8578785764039285,
+      "tp": 64,
+      "fp": 12,
+      "tn": 138,
+      "fn": 11,
+      "far": 0.08,
+      "frr": 0.14666666666666667,
+      "accuracy": 0.8977777777777778,
+      "far_skilled": 0.14666666666666667,
+      "eer_skilled": 0.14666666666666667,
+      "far_random": 0.013333333333333334,
+      "eer_random": 0.05333333333333334
+    },
+    "cedar": {
+      "threshold": 0.8578785764039285,
+      "tp": 23,
+      "fp": 8,
+      "tn": 40,
+      "fn": 1,
+      "far": 0.16666666666666666,
+      "frr": 0.041666666666666664,
+      "accuracy": 0.875,
+      "far_skilled": 0.25,
+      "eer_skilled": 0.08333333333333333,
+      "far_random": 0.08333333333333333,
+      "eer_random": 0.08333333333333333
+    },
+    "sigresize": {
+      "threshold": 0.8578785764039285,
+      "tp": 47,
+      "fp": 20,
+      "tn": 82,
+      "fn": 4,
+      "far": 0.19607843137254902,
+      "frr": 0.0784313725490196,
+      "accuracy": 0.8431372549019608,
+      "far_skilled": 0.3333333333333333,
+      "eer_skilled": 0.17647058823529413,
+      "far_random": 0.058823529411764705,
+      "eer_random": 0.058823529411764705
+    }
+  }
+}

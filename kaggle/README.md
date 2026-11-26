@@ -98,3 +98,99 @@ so `--manifest /kaggle/input/.../manifest.csv` resolves every image.
 - **CUDA OOM?** Drop `--signers-per-batch` to 8.
 - `data/` and `checkpoints/` are gitignored, so neither the PNGs nor the trained weights are
   ever committed.
+
+## 4. Genuine-random review (`genuine_random_review.ipynb`)
+
+`genuine_random_review.ipynb` isolates the **genuine-random** comparisons of an Ultimate Test
+Signs run — a genuine signature against a genuine signature of a *different* signer — and
+shows the pairs that were **accepted** (false positives) with their images side by side. It
+does not load a model or touch the GPU; it only reads the per-pair CSV and the images.
+
+| Cell | What it does |
+| --- | --- |
+| 1 | clone the repo |
+| 2 | set `PAIRS_CSV`, `IMAGE_ROOT`, `MANIFEST`, `DECISION`, `SHOW` |
+| 3 | run `scripts.analyze_genuine_random` (filter, evaluate, write CSV + HTML) |
+| 4 | summary metrics as a table |
+| 5 | per-signer breakdown |
+| 6 | per-dataset breakdown |
+| 7 | render the HTML report inline |
+| 8 | table of accepted pairs only |
+
+**Inputs you attach**
+
+| Input | What |
+| --- | --- |
+| per-pair CSV | `ultimate_pairs_grayscale_fusion_thr0.80.csv` (or any CSV from `scripts.export_ultimate_pairs`) |
+| Ultimate Test Signs | the `Ultimate Test Signs/` folder with `manifest_ultimate.csv` and the `Signer_*` image folders |
+
+The script writes two files into `OUTPUT_DIR`:
+
+- `genuine_random_pairs.csv` — the 150 genuine-random rows plus a `metric,value` summary block,
+  with `signer`, `dataset`, and `accepted` columns added.
+- `genuine_random_report.html` — a self-contained page with the reviewed pairs' images embedded
+  as base64. It works offline and renders inline in the notebook.
+
+`DECISION` selects what "accepted" means: `deep` (the cosine threshold, default), `fused`
+(the fusion threshold), `either` (either rule), or `both` (both rules). `SHOW` selects which
+pairs the HTML lists: `accepted` (default) or `all`.
+
+Outside the notebook the same review is one command:
+
+```bash
+python -m scripts.analyze_genuine_random \
+  --csv ultimate_pairs_grayscale_fusion_thr0.80.csv \
+  --image-root "Ultimate Test Signs" \
+  --manifest "Ultimate Test Signs/manifest_ultimate.csv" \
+  --output-dir genuine_random_review \
+  --decision deep --show accepted
+```
+
+On the current `ultimate_pairs_grayscale_fusion_thr0.80.csv` run that reports 10 accepted
+genuine-random pairs at the deep threshold (`FAR_random = 0.0667`) and 7 at the fused
+threshold (`FAR_random_fused = 0.0467`), over 50 signers and 150 genuine-random pairs.
+
+## 5. Random false-accept review (`random_false_accepts_review.ipynb`)
+
+`genuine_random_review.ipynb` works from a per-pair CSV. This notebook instead **replays the
+enrolment protocol** on the test split, so it needs the checkpoint, the preprocessed dataset,
+and optionally the raw dataset and the fusion config. It logs every **random** (impostor)
+query whose score reaches the threshold — the FAR_random false accepts — and writes:
+
+| Output | What |
+| --- | --- |
+| `random_false_accepts.csv` | one row per false accept: `query_id`, `query_signer_id`, `query_dataset`, `ref_signer_id`, `score`, `per_ref_scores`, plus image metadata (width, height, aspect ratio, ink density, ink bbox) for the query and each reference |
+| `random_false_accepts_summary.json` | FAR, per-dataset counts, per-reference pattern counts, and the hub analysis |
+| `contact_sheets/*.png` | the top-scoring false accepts as side-by-side sheets: the query, the five references, and each reference's score |
+
+The CSV's `pattern` column classifies each false accept as `single_reference` (one reference
+lifted the mean over the threshold), `all_refs_similar` (every reference looked convincing),
+or `mixed`. The hub analysis reports `top_1_share` / `top_5_share` for query signers and
+reference signers, so a few dominant "hub" signers are easy to spot.
+
+`DECISION` selects the score space: `deep` (the cosine threshold, default) or `fused` (the
+fusion config's calibrated `threshold`). `SCORING_DEPTH` sets which signers count as
+impostors: `1` matches `training.evaluate` (same top-level dataset), `2` keeps impostors
+within one script. `DATASET_DEPTH` controls the report labels (`2` separates `bhsig_hi` from
+`bhsig_bn`).
+
+Outside the notebook the same review is one command:
+
+```bash
+python -m scripts.analyze_random_false_accepts \
+  --checkpoint best_model.pt \
+  --manifest data/grayscale_processed/manifest.csv \
+  --image-root data/grayscale_processed \
+  --raw-root data/raw \
+  --fusion-config fusion.json \
+  --output-dir random_false_accepts \
+  --decision fused --top 20
+```
+
+On the local test split (64 signers, 35,206 random pairs) this reports **1,629** false
+accepts at the deep threshold (`FAR_random = 0.0463`) and **249** at the fused threshold
+(`FAR_random = 0.0071`). The deep false accepts split into 1,251 `mixed`, 375
+`all_refs_similar`, and 3 `single_reference`; the fused ones split into 142
+`all_refs_similar` and 107 `mixed`. At the fused operating point the top query signer
+accounts for 18.9% of the false accepts, so the failures are spread across many signers
+rather than concentrated in a few hubs.

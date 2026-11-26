@@ -1,8 +1,10 @@
 """Build the "Ultimate Test Signs" evaluation set from the raw datasets.
 
 For a fixed number of *test-split* signers (from the per-dataset manifests in
-``data/manifests/``) this script copies raw signature images into a self-contained
-folder tree::
+``data/manifests/``) this script applies the Stage 2.2 preprocessing to the raw
+signature images and writes the resulting ``384 x 192`` PNGs into a self-contained
+folder tree. Strokes are grayscale by default; pass ``--binarize`` for pure black on
+white (``0``/``255``).
 
     Ultimate Test Signs/
         Signer_001/
@@ -14,8 +16,14 @@ folder tree::
 
 Only signers whose manifest ``split`` column is ``test`` are eligible, so the set
 is disjoint from the training and validation signers. The selection is
-dataset-balanced and deterministic (``SEED``), and every copied file is recorded
+dataset-balanced and deterministic (``SEED``), and every written file is recorded
 in ``Ultimate Test Signs/manifest_ultimate.csv``.
+
+Preprocessing is :func:`preprocessing.signature_preprocessing.preprocess_signature`
+-- the same function training and inference use -- so the benchmark cannot drift from
+the model. The evaluation reads the stored images directly, so run it with
+``python -m training.evaluate_ultimate ...`` (there is no preprocessing step at evaluation
+time).
 
 "Random" negatives are drawn from another test signer of the **same dataset**
 (the repository's default ``--random-negatives within-dataset`` scope), and the
@@ -33,6 +41,10 @@ import csv
 import random
 import shutil
 from pathlib import Path
+
+import cv2
+
+from preprocessing.signature_preprocessing import preprocess_signature
 
 REPO = Path(__file__).resolve().parent.parent
 DATA = REPO / "data"
@@ -94,20 +106,41 @@ def select_signers(pool: dict[str, dict], num: int, rng: random.Random) -> list[
     return sorted(selected)
 
 
-def copy_files(paths: list[Path], dest: Path, count: int) -> list[Path]:
+def preprocess_files(
+    paths: list[Path], dest: Path, count: int, *, binarize: bool = False
+) -> list[Path]:
+    """Preprocess ``count`` raw signatures into ``dest`` as Stage 2.2 PNGs.
+
+    Every chosen file is read as a color image, passed through
+    :func:`preprocessing.signature_preprocessing.preprocess_signature` (the same step
+    training and inference use), and written as a ``384 x 192`` PNG. With ``binarize`` the
+    strokes are pure black on white (``0``/``255``); otherwise the grayscale strokes are
+    kept. The returned paths are the files that were written.
+
+    Raises:
+        SystemExit: If there are too few files, an image cannot be read, or it lacks ink.
+    """
     dest.mkdir(parents=True, exist_ok=True)
     chosen = paths[:count]
     if len(chosen) < count:
         raise SystemExit(f"not enough files for {dest}: need {count}, have {len(paths)}")
-    copied = []
+    written = []
     for src in chosen:
-        target = dest / src.name
-        shutil.copy2(src, target)
-        copied.append(target)
-    return copied
+        image = cv2.imread(str(src), cv2.IMREAD_COLOR)
+        if image is None:
+            raise SystemExit(f"could not read raw signature {src}")
+        try:
+            processed = preprocess_signature(image, binarize=binarize)
+        except ValueError as error:
+            raise SystemExit(f"could not preprocess {src}: {error}") from error
+        target = dest / src.with_suffix(".png").name
+        if not cv2.imwrite(str(target), processed):
+            raise SystemExit(f"could not write preprocessed signature {target}")
+        written.append(target)
+    return written
 
 
-def build(num: int, per_class: int, out_dir: Path) -> None:
+def build(num: int, per_class: int, out_dir: Path, *, binarize: bool = False) -> None:
     rng = random.Random(SEED)
     pool = load_test_pool()
     selected = select_signers(pool, num, rng)
@@ -121,8 +154,12 @@ def build(num: int, per_class: int, out_dir: Path) -> None:
         entry = pool[signer]
         signer_dir = out_dir / f"Signer_{index:03d}"
 
-        genuine = copy_files(entry["genuine"], signer_dir / "Genuine", per_class)
-        forged = copy_files(entry["forged"], signer_dir / "Forged", per_class)
+        genuine = preprocess_files(
+            entry["genuine"], signer_dir / "Genuine", per_class, binarize=binarize
+        )
+        forged = preprocess_files(
+            entry["forged"], signer_dir / "Forged", per_class, binarize=binarize
+        )
 
         # Random negatives: genuine signatures of a different signer in the same dataset.
         candidates = [
@@ -133,8 +170,11 @@ def build(num: int, per_class: int, out_dir: Path) -> None:
         if not candidates:
             raise SystemExit(f"no random-negative signer for {signer}")
         random_signer = rng.choice(candidates)
-        random_files = copy_files(
-            pool[random_signer]["genuine"], signer_dir / "Random", per_class
+        random_files = preprocess_files(
+            pool[random_signer]["genuine"],
+            signer_dir / "Random",
+            per_class,
+            binarize=binarize,
         )
 
         for kind, files in (
@@ -171,7 +211,8 @@ def build(num: int, per_class: int, out_dir: Path) -> None:
         writer.writerows(rows)
 
     print(f"Built {len(selected)} signers under {out_dir}")
-    print(f"Wrote {len(rows)} rows to {out_dir / 'manifest_ultimate.csv'}")
+    style = "binarized" if binarize else "grayscale"
+    print(f"Wrote {len(rows)} {style} rows to {out_dir / 'manifest_ultimate.csv'}")
 
 
 def main() -> None:
@@ -179,8 +220,13 @@ def main() -> None:
     parser.add_argument("--num-signers", type=int, default=50)
     parser.add_argument("--per-class", type=int, default=3)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUT)
+    parser.add_argument(
+        "--binarize",
+        action="store_true",
+        help="Write pure black-on-white (0/255) PNGs instead of grayscale strokes.",
+    )
     args = parser.parse_args()
-    build(args.num_signers, args.per_class, args.output)
+    build(args.num_signers, args.per_class, args.output, binarize=args.binarize)
 
 
 if __name__ == "__main__":
